@@ -1,6 +1,6 @@
 use super::{
     close_client_statements,
-    copy::CopySpec,
+    copy::{self, CopySpec},
     deallocate_statement,
     describe::{Describe, MetadataColumn, PortalDescribe, QueryType, StatementDescribe},
     result::{ExecuteResult, Rows},
@@ -472,7 +472,7 @@ pub fn collect_param_oids(inferred_types: &[SbroadType], client_types: &[Oid]) -
 
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
-pub struct PreparedStatementMetadata {
+pub struct StatementMetadata {
     pub query: String,
     pub tier: Option<SmolStr>,
     // Vector which contains pairs of
@@ -480,10 +480,7 @@ pub struct PreparedStatementMetadata {
     pub dk_meta: Vec<(u16, Oid)>,
 }
 
-pub fn build_prepared_statement_metadata(
-    statement: &Statement,
-    query: &str,
-) -> PgResult<PreparedStatementMetadata> {
+pub fn build_statement_metadata(statement: &Statement, query: &str) -> PgResult<StatementMetadata> {
     let (tier, dk_meta) = match statement.statement_kind() {
         StatementKind::Sql(prepared_statement) => {
             let tier = prepared_statement.as_plan().tier.clone();
@@ -497,7 +494,7 @@ pub fn build_prepared_statement_metadata(
         StatementKind::Copy(_) => (None, vec![]),
     };
 
-    Ok(PreparedStatementMetadata {
+    Ok(StatementMetadata {
         query: query.to_string(),
         tier,
         dk_meta,
@@ -562,6 +559,15 @@ fn port_read_changed<'bytes>(mut port: impl Iterator<Item = &'bytes [u8]>) -> Pg
     let mut cur = Cursor::new(first_mp);
     let changed: usize = rmp::decode::read_int(&mut cur).map_err(PgError::other)?;
     Ok(changed)
+}
+
+pub(crate) fn execute_bound_dml(
+    router: &RouterRuntime,
+    statement: sql::BoundStatement,
+) -> PgResult<usize> {
+    let mut port = PicoPortOwned::new();
+    crate::sql::dispatch_bound_statement(router, statement, None, None, &mut port)?;
+    port_read_changed(port.iter())
 }
 
 enum PortalState {
@@ -656,6 +662,15 @@ impl PortalInner {
             }
         }
 
+        if matches!(self.describe.query_type(), QueryType::Dml) {
+            let row_count = execute_bound_dml(router, statement)?;
+            let tag = self.describe.command_tag();
+            return Ok(PortalState::ResultReady(ExecuteResult::Dml {
+                row_count,
+                tag,
+            }));
+        }
+
         let mut port = PicoPortOwned::new();
         crate::sql::dispatch_bound_statement(router, statement, None, None, &mut port)?;
 
@@ -668,11 +683,7 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::Tcl { tag })
             }
-            QueryType::Dml => {
-                let row_count = port_read_changed(port.iter())?;
-                let tag = self.describe.command_tag();
-                PortalState::ResultReady(ExecuteResult::Dml { row_count, tag })
-            }
+            QueryType::Dml => unreachable!("DML portals use execute_bound_dml"),
             QueryType::Dql => {
                 let rows = port_read_tuples(
                     port.iter().skip(1),
@@ -713,12 +724,7 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::AclOrDdl { tag })
             }
-            QueryType::Copy => {
-                let StatementKind::Copy(spec) = self.statement.statement_kind() else {
-                    return Err(PgError::other("COPY portal requires COPY statement"));
-                };
-                PortalState::ResultReady(ExecuteResult::CopyInStartRequested { spec: spec.clone() })
-            }
+            QueryType::Copy => unreachable!("COPY portals are started from CopyReady"),
             QueryType::Empty => PortalState::ResultReady(ExecuteResult::Empty),
         };
 
@@ -755,7 +761,9 @@ impl PortalInner {
                     Ok((None, self.start_sql(runtime, bound_statement)?))
                 }
                 PortalState::CopyReady(spec) => Ok((
-                    Some(ExecuteResult::CopyInStartRequested { spec }),
+                    Some(ExecuteResult::CopyInStart {
+                        start: copy::start_copy(self.key.0, spec)?,
+                    }),
                     PortalState::Done,
                 )),
                 PortalState::ResultReady(result) => Ok((Some(result), PortalState::Done)),

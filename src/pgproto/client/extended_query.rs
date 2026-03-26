@@ -1,6 +1,6 @@
 use super::{copy_in, MessageExecutionOutcome};
 use crate::pgproto::backend::result::ExecuteResult;
-use crate::pgproto::backend::storage::{self, build_prepared_statement_metadata, PG_STATEMENTS};
+use crate::pgproto::backend::storage::{self, build_statement_metadata, PG_STATEMENTS};
 use crate::pgproto::backend::Backend;
 use crate::pgproto::error::EncodingError;
 use crate::pgproto::stream::{BeMessage, FeMessage};
@@ -23,7 +23,7 @@ pub fn query_metadata_message(
         .with(|storage| storage.borrow().get(&key).map(|holder| holder.statement()))
         .ok_or_else(|| PgError::other(format!("Couldn't find statement '{}'.", key.1)))?;
 
-    let metadata = build_prepared_statement_metadata(&statement, query)?;
+    let metadata = build_statement_metadata(&statement, query)?;
     let message = serde_json::to_string(&metadata).map_err(EncodingError::new)?;
 
     Ok(messages::notice(message))
@@ -105,9 +105,6 @@ pub fn process_execute_message(
             return Ok(MessageExecutionOutcome::EnterCopyIn(
                 copy_in::CopyInMode::ExtendedQuery,
             ));
-        }
-        ExecuteResult::CopyInStartRequested { .. } => {
-            unreachable!("extended query COPY should be started by backend before transport")
         }
     }
 

@@ -40,9 +40,6 @@ pub fn process_query_message(
                 copy_in::CopyInMode::SimpleQuery,
             ));
         }
-        ExecuteResult::CopyInStartRequested { .. } => {
-            unreachable!("simple query COPY should be started by backend before transport")
-        }
         ExecuteResult::SuspendedDql { .. } => {
             unreachable!("portal cannot be suspended in simple query")
         }

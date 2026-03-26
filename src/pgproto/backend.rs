@@ -14,13 +14,12 @@ use crate::tlog;
 use crate::{
     pgproto::value::{FieldFormat, RawFormat},
     schema::ADMIN_ID,
-    storage::ToEntryIter,
 };
 use bytes::Bytes;
 use postgres_types::Oid;
 use smol_str::format_smolstr;
 use sql::ir::value::Value as SbroadValue;
-use sql::PreparedCommand;
+use sql::Command as PlannerCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage::param_oid_to_derived_type;
 use tarantool::session::with_su;
@@ -160,12 +159,12 @@ pub fn parse(id: ClientId, name: String, query: &str, param_oids: Vec<Oid>) -> P
         .map(|oid| param_oid_to_derived_type(*oid))
         .collect::<Result<_, _>>()?;
 
-    let statement = match PreparedCommand::parse(&router, query, &param_types)? {
-        PreparedCommand::Copy(copy_statement) => Statement::new_copy(
+    let statement = match sql::parse_command(&router, query, &param_types)? {
+        PlannerCommand::Copy(copy_statement) => Statement::new_copy(
             key.clone(),
             copy::CopySpec::try_from_statement(copy_statement)?,
         ),
-        PreparedCommand::Sql(prepared_statement) => {
+        PlannerCommand::Sql(prepared_statement) => {
             Statement::new_sql(key.clone(), prepared_statement, param_oids)?
         }
     };
@@ -390,13 +389,7 @@ impl Backend {
     /// non-dql queries max_rows is ignored and result with no rows is returned.
     pub fn execute(&self, portal: Option<String>, max_rows: i64) -> PgResult<ExecuteResult> {
         let name = portal.unwrap_or_default();
-        match execute(self.client_id, name, max_rows)? {
-            ExecuteResult::CopyInStartRequested { spec } => {
-                let start = copy::start_copy(self, spec)?;
-                Ok(ExecuteResult::CopyInStart { start })
-            }
-            result => Ok(result),
-        }
+        execute(self.client_id, name, max_rows)
     }
 
     /// Handler for a Close message.
@@ -432,17 +425,27 @@ impl Backend {
         copy::abort_copy(self)
     }
 
-    /// COPY FROM STDIN is intentionally restricted to a single-node topology.
-    pub fn ensure_single_node_topology(&self) -> PgResult<()> {
-        let node = crate::traft::node::global()?;
-        let replicaset_count = node.storage.replicasets.iter()?.count();
-        let instance_count = node.storage.instances.iter()?.count();
-        if replicaset_count != 1 || instance_count != 1 {
-            return Err(PgError::FeatureNotSupported(format_smolstr!(
-                "COPY FROM STDIN is available only for single-node clusters",
-            )));
-        }
-        Ok(())
+    pub(crate) fn bind_sql_statement(
+        &self,
+        sql: &str,
+        params: Vec<Option<Bytes>>,
+    ) -> PgResult<sql::BoundStatement> {
+        let router = RouterRuntime::new();
+        let prepared = sql::PreparedStatement::parse(&router, sql, &[])?;
+        let inferred_types = prepared.collect_parameter_types();
+        let param_oids = storage::collect_param_oids(&inferred_types, &[]);
+        let params = decode_parameters(
+            params,
+            &param_oids,
+            &vec![FieldFormat::Text; param_oids.len()],
+            sql,
+        )?;
+
+        let Some(sql_options) = DYNAMIC_CONFIG.current_sql_options() else {
+            return Err(PgError::other("Not initialized yet"));
+        };
+        let effective_options = self.params.execution_options().unwrap_or(sql_options);
+        prepared.bind(params, effective_options).map_err(Into::into)
     }
 
     fn on_disconnect(&self) {

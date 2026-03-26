@@ -5,6 +5,7 @@ use crate::pgproto::stream::{FeMessage, PgStream};
 use smol_str::format_smolstr;
 use std::io::{Read, Write};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CopyInMode {
     SimpleQuery,
     ExtendedQuery,

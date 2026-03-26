@@ -112,7 +112,7 @@ pub fn proc_pg_execute(id: ClientId, name: String, max_rows: i64) -> PgResult<Tu
         }
         ExecuteResult::FinishedDql { rows, .. } => Ok(encode_proc_rows(rows.values(), true)),
         ExecuteResult::SuspendedDql { rows } => Ok(encode_proc_rows(rows.values(), false)),
-        ExecuteResult::CopyInStartRequested { .. } | ExecuteResult::CopyInStart { .. } => {
+        ExecuteResult::CopyInStart { .. } => {
             return Err(crate::pgproto::error::PgError::other(
                 "COPY IN portals are not supported by proc_pg_execute",
             ));

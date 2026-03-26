@@ -1,23 +1,16 @@
-use super::result::{CopyStart, ExecuteResult};
+use super::result::CopyStart;
 use super::Backend;
 use crate::catalog::pico_bucket::DEFAULT_BUCKET_ID_COLUMN_NAME;
 use crate::pgproto::client::ClientId;
 use crate::pgproto::error::{PedanticError, PgError, PgErrorCode, PgResult};
-use crate::pgproto::value::RawFormat;
-use crate::schema::{ADMIN_ID, Distribution, TableDef};
-use crate::storage::Catalog;
+use crate::schema::{Distribution, TableDef, ADMIN_ID};
+use crate::storage::{Catalog, ToEntryIter};
 use bytes::Bytes;
 use smol_str::{format_smolstr, SmolStr};
-use sql::executor::engine::helpers::normalize_name_from_sql;
-use sql::{CopyFormat, CopyInput, CopyStatement as ParsedCopyStatement};
+use sql::{CopyFormat, CopyStatement as ParsedCopyStatement};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tarantool::session::with_su;
-
-const COPY_TEXT_FORMAT: RawFormat = 0;
-
-static COPY_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static COPY_SESSIONS: RefCell<BTreeMap<ClientId, CopySession>> = RefCell::new(BTreeMap::new());
@@ -25,8 +18,9 @@ thread_local! {
 
 #[derive(Debug, Clone)]
 pub struct CopySpec {
-    table_name: String,
-    columns: Vec<String>,
+    schema_name: Option<SmolStr>,
+    table_name: SmolStr,
+    columns: Vec<SmolStr>,
     delimiter: u8,
     null_marker: Vec<u8>,
     header: bool,
@@ -41,8 +35,6 @@ impl CopySpec {
         let sql::CopyStatement::From(copy_from) = statement else {
             return Err(unsupported_copy("COPY TO is not supported"));
         };
-
-        let CopyInput::Stdin = copy_from.input;
 
         // TODO: extend COPY decoding beyond text once the MVP protocol and execution
         // contract is settled. CSV and binary should plug into the same resolved spec
@@ -64,6 +56,7 @@ impl CopySpec {
             .unwrap_or_else(|| String::from("\\N"));
 
         Ok(Self {
+            schema_name: copy_from.table.schema_name,
             table_name: copy_from.table.table_name,
             columns: copy_from.table.columns,
             delimiter,
@@ -352,9 +345,6 @@ impl CopySession {
 
         // TODO: replace the buffered single-statement INSERT synthesis with a dedicated
         // COPY apply path once COPY grows beyond the current strict single-node MVP.
-        let statement_id = COPY_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        let statement_name = format!("__pico_copy_stmt_{statement_id}");
-        let portal_name = format!("__pico_copy_portal_{statement_id}");
         let sql = self.spec.build_insert_sql(self.row_buffer.len());
 
         let mut params = Vec::with_capacity(self.row_buffer.len() * self.spec.field_count);
@@ -362,25 +352,9 @@ impl CopySession {
             params.extend(row.iter().cloned());
         }
 
-        let result = (|| {
-            backend.parse(Some(statement_name.clone()), &sql, vec![])?;
-            backend.bind(
-                Some(statement_name.clone()),
-                Some(portal_name.clone()),
-                params,
-                &[COPY_TEXT_FORMAT],
-                &[COPY_TEXT_FORMAT],
-            )?;
-
-            match backend.execute(Some(portal_name.clone()), -1)? {
-                ExecuteResult::Dml { row_count, .. } => Ok(row_count),
-                _ => Err(PgError::other("unexpected COPY execution result kind")),
-            }
-        })();
-
-        backend.close_portal(Some(&portal_name));
-        backend.close_statement(Some(&statement_name));
-        result
+        let bound = backend.bind_sql_statement(&sql, params)?;
+        let router = crate::sql::router::RouterRuntime::new();
+        super::storage::execute_bound_dml(&router, bound)
     }
 }
 
@@ -443,41 +417,15 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn split_top_level_dot(name: &str) -> Option<usize> {
-    let bytes = name.as_bytes();
-    let mut idx = 0usize;
-    let mut in_quotes = false;
-
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'"' => {
-                if in_quotes && bytes.get(idx + 1) == Some(&b'"') {
-                    idx += 2;
-                    continue;
-                }
-                in_quotes = !in_quotes;
-            }
-            b'.' if !in_quotes => return Some(idx),
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    None
-}
-
-fn normalize_table_name(name: &str) -> PgResult<SmolStr> {
-    if let Some(dot_idx) = split_top_level_dot(name) {
-        let schema_name = normalize_name_from_sql(&name[..dot_idx]);
+fn ensure_supported_schema(schema_name: Option<&SmolStr>) -> PgResult<()> {
+    if let Some(schema_name) = schema_name {
         if schema_name != "public" {
             return Err(PgError::FeatureNotSupported(format_smolstr!(
                 "COPY FROM STDIN currently supports only the public schema"
             )));
         }
-        Ok(normalize_name_from_sql(&name[dot_idx + 1..]))
-    } else {
-        Ok(normalize_name_from_sql(name))
     }
+    Ok(())
 }
 
 fn sql_quote_identifier(name: &str) -> String {
@@ -486,7 +434,10 @@ fn sql_quote_identifier(name: &str) -> String {
 }
 
 fn default_copy_columns(table_def: &TableDef) -> Vec<String> {
-    let skip_implicit_bucket_id = matches!(table_def.distribution, Distribution::ShardedImplicitly { .. });
+    let skip_implicit_bucket_id = matches!(
+        table_def.distribution,
+        Distribution::ShardedImplicitly { .. }
+    );
 
     table_def
         .format
@@ -500,7 +451,8 @@ fn default_copy_columns(table_def: &TableDef) -> Vec<String> {
 
 fn resolve_copy_spec(spec: CopySpec) -> PgResult<ResolvedCopySpec> {
     let storage = Catalog::try_get(false).expect("storage should be initialized");
-    let table_name = normalize_table_name(&spec.table_name)?;
+    ensure_supported_schema(spec.schema_name.as_ref())?;
+    let table_name = spec.table_name.clone();
     let table_def = with_su(ADMIN_ID, || storage.pico_table.by_name(&table_name))??
         .ok_or_else(|| PgError::other(format!("table does not exist: {}", spec.table_name)))?;
 
@@ -509,11 +461,10 @@ fn resolve_copy_spec(spec: CopySpec) -> PgResult<ResolvedCopySpec> {
     } else {
         let mut columns = Vec::with_capacity(spec.columns.len());
         for column in &spec.columns {
-            let column_name = normalize_name_from_sql(column);
             let field = table_def
                 .format
                 .iter()
-                .find(|field| field.name == column_name)
+                .find(|field| field.name == *column)
                 .ok_or_else(|| PgError::other(format!("column does not exist: {column}")))?;
             columns.push(sql_quote_identifier(&field.name));
         }
@@ -541,8 +492,20 @@ fn load_table_schema_version(table_name: &SmolStr) -> PgResult<u64> {
     Ok(table_def.schema_version)
 }
 
-pub fn start_copy(backend: &Backend, spec: CopySpec) -> PgResult<CopyStart> {
-    backend.ensure_single_node_topology()?;
+fn ensure_single_node_topology() -> PgResult<()> {
+    let node = crate::traft::node::global()?;
+    let replicaset_count = node.storage.replicasets.iter()?.count();
+    let instance_count = node.storage.instances.iter()?.count();
+    if replicaset_count != 1 || instance_count != 1 {
+        return Err(PgError::FeatureNotSupported(format_smolstr!(
+            "COPY FROM STDIN is available only for single-node clusters",
+        )));
+    }
+    Ok(())
+}
+
+pub fn start_copy(client_id: ClientId, spec: CopySpec) -> PgResult<CopyStart> {
+    ensure_single_node_topology()?;
     let resolved = resolve_copy_spec(spec)?;
     let start = CopyStart {
         column_count: resolved.field_count,
@@ -551,7 +514,7 @@ pub fn start_copy(backend: &Backend, spec: CopySpec) -> PgResult<CopyStart> {
     COPY_SESSIONS.with(|storage| {
         let prev = storage
             .borrow_mut()
-            .insert(backend.client_id(), CopySession::new(resolved));
+            .insert(client_id, CopySession::new(resolved));
         if prev.is_some() {
             return Err(PgError::other("COPY session already exists"));
         }
@@ -590,12 +553,11 @@ pub fn abort_copy(backend: &Backend) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sql::PreparedCommand;
 
     fn parse_spec(sql: &str) -> PgResult<CopySpec> {
         let router = crate::sql::router::RouterRuntime::new();
-        let PreparedCommand::Copy(statement) =
-            PreparedCommand::parse(&router, sql, &[]).map_err(PgError::other)?
+        let sql::Command::Copy(statement) =
+            sql::parse_command(&router, sql, &[]).map_err(PgError::other)?
         else {
             panic!("COPY statement");
         };
@@ -622,8 +584,8 @@ mod tests {
             r#"COPY "t" ("id", "value") FROM STDIN WITH (DELIMITER '|', NULL 'nil', HEADER true)"#,
         )
         .expect("copy spec");
-        assert_eq!(spec.table_name, r#""t""#);
-        assert_eq!(spec.columns, vec![r#""id""#, r#""value""#]);
+        assert_eq!(spec.table_name, "t");
+        assert_eq!(spec.columns, vec!["id", "value"]);
         assert_eq!(spec.delimiter, b'|');
         assert_eq!(spec.null_marker, b"nil");
         assert!(spec.header);
