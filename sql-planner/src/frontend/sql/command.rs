@@ -1,20 +1,18 @@
 use super::ast::{ParseTree, Rule};
 use crate::errors::{Entity, SbroadError};
-use crate::{
-    CopyFormat, CopyFrom, CopyInput, CopyOptions, CopyOutput, CopyStatement, CopyTableTarget,
-    CopyTo, CopyToSource,
-};
+use crate::executor::engine::helpers::normalize_name_from_sql;
+use crate::{CopyFormat, CopyFrom, CopyOptions, CopyStatement, CopyTableTarget, CopyTo};
 use pest::iterators::Pair;
 use pest::Parser;
-use smol_str::format_smolstr;
+use smol_str::{format_smolstr, SmolStr};
 
 #[derive(Debug)]
-pub(crate) enum ParsedCommand {
+pub enum ParsedCommand {
     Sql,
     Copy(CopyStatement),
 }
 
-pub(crate) fn parse_command(query: &str) -> Result<ParsedCommand, SbroadError> {
+pub fn parse_command(query: &str) -> Result<ParsedCommand, SbroadError> {
     let top_pair = parse_top_level_command(query)?;
 
     match top_pair.as_rule() {
@@ -34,7 +32,7 @@ fn parse_top_level_command<'query>(query: &'query str) -> Result<Pair<'query, Ru
 fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
     debug_assert_eq!(pair.as_rule(), Rule::Copy);
 
-    let mut table_name = None;
+    let mut target = None;
     let mut columns = Vec::new();
     let mut direction = None;
     let mut endpoint = None;
@@ -42,8 +40,8 @@ fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
 
     for child in pair.into_inner() {
         match child.as_rule() {
-            Rule::CopyTableName => table_name = Some(child.as_str().to_string()),
-            Rule::Identifier => columns.push(child.as_str().to_string()),
+            Rule::CopyTableName => target = Some(parse_table_name(child.as_str())?),
+            Rule::Identifier => columns.push(normalize_name_from_sql(child.as_str())),
             Rule::CopyDirection => {
                 direction = Some(match child.as_str().to_ascii_lowercase().as_str() {
                     "from" => ParsedDirection::From,
@@ -75,10 +73,12 @@ fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
         }
     }
 
+    let (schema_name, table_name) = target.ok_or_else(|| {
+        SbroadError::Invalid(Entity::Query, Some("COPY table name is missing".into()))
+    })?;
     let table = CopyTableTarget {
-        table_name: table_name.ok_or_else(|| {
-            SbroadError::Invalid(Entity::Query, Some("COPY table name is missing".into()))
-        })?,
+        schema_name,
+        table_name,
         columns,
     };
 
@@ -90,16 +90,12 @@ fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
     })?;
 
     match (direction, endpoint) {
-        (ParsedDirection::From, ParsedEndpoint::Stdin) => Ok(CopyStatement::From(CopyFrom {
-            table,
-            input: CopyInput::Stdin,
-            options,
-        })),
-        (ParsedDirection::To, ParsedEndpoint::Stdout) => Ok(CopyStatement::To(CopyTo {
-            source: CopyToSource::Table(table),
-            output: CopyOutput::Stdout,
-            options,
-        })),
+        (ParsedDirection::From, ParsedEndpoint::Stdin) => {
+            Ok(CopyStatement::From(CopyFrom { table, options }))
+        }
+        (ParsedDirection::To, ParsedEndpoint::Stdout) => {
+            Ok(CopyStatement::To(CopyTo { table, options }))
+        }
         (ParsedDirection::From, ParsedEndpoint::Stdout) => Err(SbroadError::Invalid(
             Entity::Query,
             Some("COPY FROM STDOUT is invalid".into()),
@@ -162,6 +158,39 @@ fn unquote_single_quoted(raw: &str) -> String {
     raw[1..raw.len() - 1].replace("''", "'")
 }
 
+fn parse_table_name(raw: &str) -> Result<(Option<SmolStr>, SmolStr), SbroadError> {
+    Ok(match split_top_level_dot(raw) {
+        Some(dot_idx) => (
+            Some(normalize_name_from_sql(&raw[..dot_idx])),
+            normalize_name_from_sql(&raw[dot_idx + 1..]),
+        ),
+        None => (None, normalize_name_from_sql(raw)),
+    })
+}
+
+fn split_top_level_dot(name: &str) -> Option<usize> {
+    let bytes = name.as_bytes();
+    let mut idx = 0usize;
+    let mut in_quotes = false;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'"' => {
+                if in_quotes && bytes.get(idx + 1) == Some(&b'"') {
+                    idx += 2;
+                    continue;
+                }
+                in_quotes = !in_quotes;
+            }
+            b'.' if !in_quotes => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
 #[derive(Clone, Copy)]
 enum ParsedDirection {
     From,
@@ -177,7 +206,7 @@ enum ParsedEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{parse_command, ParsedCommand};
-    use crate::{CopyFormat, CopyFrom, CopyInput, CopyOptions, CopyStatement, CopyTableTarget};
+    use crate::{CopyFormat, CopyFrom, CopyOptions, CopyStatement, CopyTableTarget};
 
     fn parse_copy(query: &str) -> CopyStatement {
         match parse_command(query).expect("parse command") {
@@ -196,10 +225,10 @@ mod tests {
             parsed,
             CopyStatement::From(CopyFrom {
                 table: CopyTableTarget {
-                    table_name: r#""t""#.into(),
-                    columns: vec![r#""id""#.into(), r#""value""#.into()],
+                    schema_name: None,
+                    table_name: "t".into(),
+                    columns: vec!["id".into(), "value".into()],
                 },
-                input: CopyInput::Stdin,
                 options: CopyOptions {
                     format: CopyFormat::Text,
                     delimiter: Some("|".into()),
@@ -218,4 +247,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn normalizes_schema_qualified_copy_target() {
+        let parsed = parse_copy(r#"COPY public."Mixed Table" ("Mixed Column") FROM STDIN"#);
+
+        assert_eq!(
+            parsed,
+            CopyStatement::From(CopyFrom {
+                table: CopyTableTarget {
+                    schema_name: Some("public".into()),
+                    table_name: "Mixed Table".into(),
+                    columns: vec!["Mixed Column".into()],
+                },
+                options: CopyOptions::default(),
+            })
+        );
+    }
 }

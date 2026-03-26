@@ -6,6 +6,7 @@ extern crate core;
 use crate::errors::SbroadError;
 use crate::executor::engine::{query_id, Metadata, Router, VersionMap};
 use crate::executor::lru::Cache;
+use crate::frontend::sql::command;
 use crate::frontend::Ast;
 use crate::ir::helpers::RepeatableState;
 use crate::ir::options::Options;
@@ -33,39 +34,29 @@ pub enum CopyStatement {
     To(CopyTo),
 }
 
+#[derive(Debug)]
+pub enum Command {
+    Sql(PreparedStatement),
+    Copy(CopyStatement),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFrom {
     pub table: CopyTableTarget,
-    pub input: CopyInput,
     pub options: CopyOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyTo {
-    pub source: CopyToSource,
-    pub output: CopyOutput,
+    pub table: CopyTableTarget,
     pub options: CopyOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyTableTarget {
-    pub table_name: String,
-    pub columns: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CopyToSource {
-    Table(CopyTableTarget),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyInput {
-    Stdin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyOutput {
-    Stdout,
+    pub schema_name: Option<SmolStr>,
+    pub table_name: SmolStr,
+    pub columns: Vec<SmolStr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,30 +85,22 @@ pub enum CopyFormat {
     Binary,
 }
 
-#[derive(Debug)]
-pub enum PreparedCommand {
-    Sql(PreparedStatement),
-    Copy(CopyStatement),
-}
-
-impl PreparedCommand {
-    pub fn parse<R>(
-        router: &R,
-        query_text: &str,
-        param_types: &[DerivedType],
-    ) -> Result<Self, SbroadError>
-    where
-        R: Router,
-        R::MetadataProvider: Metadata,
-        R::Cache: Cache<SmolStr, Rc<Plan>>,
-        R::ParseTree: Ast,
-    {
-        match frontend::sql::command::parse_command(query_text)? {
-            frontend::sql::command::ParsedCommand::Sql => {
-                PreparedStatement::parse(router, query_text, param_types).map(Self::Sql)
-            }
-            frontend::sql::command::ParsedCommand::Copy(statement) => Ok(Self::Copy(statement)),
+pub fn parse_command<R>(
+    router: &R,
+    query_text: &str,
+    param_types: &[DerivedType],
+) -> Result<Command, SbroadError>
+where
+    R: Router,
+    R::MetadataProvider: Metadata,
+    R::Cache: Cache<SmolStr, Rc<Plan>>,
+    R::ParseTree: Ast,
+{
+    match command::parse_command(query_text)? {
+        command::ParsedCommand::Sql => {
+            PreparedStatement::parse_sql(router, query_text, param_types).map(Command::Sql)
         }
+        command::ParsedCommand::Copy(statement) => Ok(Command::Copy(statement)),
     }
 }
 
@@ -137,6 +120,20 @@ impl PreparedStatement {
     ///
     /// This function will attempt to cache the optimized plan into the router's query plan cache.
     pub fn parse<R>(
+        router: &R,
+        query_text: &str,
+        param_types: &[DerivedType],
+    ) -> Result<PreparedStatement, SbroadError>
+    where
+        R: Router,
+        R::MetadataProvider: Metadata,
+        R::Cache: Cache<SmolStr, Rc<Plan>>,
+        R::ParseTree: Ast,
+    {
+        Self::parse_sql(router, query_text, param_types)
+    }
+
+    fn parse_sql<R>(
         router: &R,
         query_text: &str,
         param_types: &[DerivedType],
