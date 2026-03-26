@@ -27,6 +27,100 @@ pub mod ir;
 pub mod log;
 pub mod utils;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyStatement {
+    From(CopyFrom),
+    To(CopyTo),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFrom {
+    pub table: CopyTableTarget,
+    pub input: CopyInput,
+    pub options: CopyOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTo {
+    pub source: CopyToSource,
+    pub output: CopyOutput,
+    pub options: CopyOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTableTarget {
+    pub table_name: String,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyToSource {
+    Table(CopyTableTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyInput {
+    Stdin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutput {
+    Stdout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOptions {
+    pub format: CopyFormat,
+    pub delimiter: Option<String>,
+    pub null_string: Option<String>,
+    pub header: bool,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            format: CopyFormat::Text,
+            delimiter: None,
+            null_string: None,
+            header: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Text,
+    Csv,
+    Binary,
+}
+
+#[derive(Debug)]
+pub enum PreparedCommand {
+    Sql(PreparedStatement),
+    Copy(CopyStatement),
+}
+
+impl PreparedCommand {
+    pub fn parse<R>(
+        router: &R,
+        query_text: &str,
+        param_types: &[DerivedType],
+    ) -> Result<Self, SbroadError>
+    where
+        R: Router,
+        R::MetadataProvider: Metadata,
+        R::Cache: Cache<SmolStr, Rc<Plan>>,
+        R::ParseTree: Ast,
+    {
+        match frontend::sql::command::parse_command(query_text)? {
+            frontend::sql::command::ParsedCommand::Sql => {
+                PreparedStatement::parse(router, query_text, param_types).map(Self::Sql)
+            }
+            frontend::sql::command::ParsedCommand::Copy(statement) => Ok(Self::Copy(statement)),
+        }
+    }
+}
+
 /// A parsed parameterized query. It still has parameter placeholders instead of actual parameter values.
 #[derive(Debug)]
 pub struct PreparedStatement {
