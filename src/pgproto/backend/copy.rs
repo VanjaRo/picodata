@@ -1,9 +1,27 @@
-use super::result::CopyStart;
+use super::result::{CopyStart, ExecuteResult};
 use super::Backend;
-use crate::pgproto::error::{PgError, PgResult};
+use crate::catalog::pico_bucket::DEFAULT_BUCKET_ID_COLUMN_NAME;
+use crate::pgproto::client::ClientId;
+use crate::pgproto::error::{PedanticError, PgError, PgErrorCode, PgResult};
+use crate::pgproto::value::RawFormat;
+use crate::schema::{ADMIN_ID, Distribution, TableDef};
+use crate::storage::Catalog;
 use bytes::Bytes;
-use smol_str::format_smolstr;
+use smol_str::{format_smolstr, SmolStr};
+use sql::executor::engine::helpers::normalize_name_from_sql;
 use sql::{CopyFormat, CopyInput, CopyStatement as ParsedCopyStatement};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tarantool::session::with_su;
+
+const COPY_TEXT_FORMAT: RawFormat = 0;
+
+static COPY_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static COPY_SESSIONS: RefCell<BTreeMap<ClientId, CopySession>> = RefCell::new(BTreeMap::new());
+}
 
 #[derive(Debug, Clone)]
 pub struct CopySpec {
@@ -26,6 +44,9 @@ impl CopySpec {
 
         let CopyInput::Stdin = copy_from.input;
 
+        // TODO: extend COPY decoding beyond text once the MVP protocol and execution
+        // contract is settled. CSV and binary should plug into the same resolved spec
+        // and session flow instead of growing ad hoc branches here.
         if copy_from.options.format != CopyFormat::Text {
             return Err(unsupported_copy(format_smolstr!(
                 "COPY format {} is not supported",
@@ -52,25 +73,316 @@ impl CopySpec {
     }
 }
 
-pub fn start_copy(_backend: &Backend, _spec: CopySpec) -> PgResult<CopyStart> {
-    Err(PgError::FeatureNotSupported(format_smolstr!(
-        "COPY FROM STDIN execution is not available yet"
-    )))
+#[derive(Debug, Clone)]
+struct ResolvedCopySpec {
+    table_name: SmolStr,
+    table_sql: String,
+    columns_sql: Vec<String>,
+    field_count: usize,
+    delimiter: u8,
+    null_marker: Vec<u8>,
+    header: bool,
+    schema_version: u64,
 }
 
-pub fn on_copy_data(_backend: &Backend, _data: Bytes) -> PgResult<()> {
-    Err(PgError::ProtocolViolation(format_smolstr!(
-        "COPY session is missing"
-    )))
+impl ResolvedCopySpec {
+    fn build_insert_sql(&self, row_count: usize) -> String {
+        let mut values = String::new();
+        let mut parameter_idx = 1usize;
+
+        for row_idx in 0..row_count {
+            if row_idx > 0 {
+                values.push_str(", ");
+            }
+            values.push('(');
+            for field_idx in 0..self.field_count {
+                if field_idx > 0 {
+                    values.push_str(", ");
+                }
+                values.push('$');
+                values.push_str(&parameter_idx.to_string());
+                parameter_idx += 1;
+            }
+            values.push(')');
+        }
+
+        let columns = if self.columns_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.columns_sql.join(", "))
+        };
+
+        format!(
+            "INSERT INTO {}{} VALUES {}",
+            self.table_sql, columns, values
+        )
+    }
 }
 
-pub fn on_copy_done(_backend: &Backend) -> PgResult<usize> {
-    Err(PgError::ProtocolViolation(format_smolstr!(
-        "COPY session is missing"
-    )))
+struct CopySession {
+    spec: ResolvedCopySpec,
+    skipped_header: bool,
+    pending_data: Vec<u8>,
+    row_buffer: Vec<Vec<Option<Bytes>>>,
 }
 
-pub fn abort_copy(_backend: &Backend) {}
+impl CopySession {
+    fn new(spec: ResolvedCopySpec) -> Self {
+        Self {
+            spec,
+            skipped_header: false,
+            pending_data: Vec::new(),
+            row_buffer: Vec::new(),
+        }
+    }
+
+    fn on_copy_data(&mut self, data: Bytes) -> PgResult<()> {
+        self.pending_data.extend_from_slice(data.as_ref());
+
+        while let Some((line_end, line_ending_len)) = find_line_end(&self.pending_data) {
+            let line = self.pending_data[..line_end].to_vec();
+            self.pending_data.drain(0..line_end + line_ending_len);
+            self.process_line(&line)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_copy_done(mut self, backend: &Backend) -> PgResult<usize> {
+        self.finish_pending_line()?;
+        self.ensure_schema_unchanged()?;
+        self.apply_rows(backend)
+    }
+
+    fn process_line(&mut self, line: &[u8]) -> PgResult<()> {
+        if self.spec.header && !self.skipped_header {
+            self.skipped_header = true;
+            return Ok(());
+        }
+
+        self.row_buffer.push(self.parse_row(line)?);
+        Ok(())
+    }
+
+    fn finish_pending_line(&mut self) -> PgResult<()> {
+        if self.pending_data.is_empty() {
+            return Ok(());
+        }
+
+        let mut line = std::mem::take(&mut self.pending_data);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        self.process_line(&line)
+    }
+
+    fn parse_row(&self, line: &[u8]) -> PgResult<Vec<Option<Bytes>>> {
+        let fields = self.split_raw_fields(line);
+        if fields.len() != self.spec.field_count {
+            return Err(PedanticError::new(
+                PgErrorCode::InvalidTextRepresentation,
+                format!(
+                    "COPY row has {} columns but expected {}",
+                    fields.len(),
+                    self.spec.field_count
+                ),
+            )
+            .into());
+        }
+
+        fields
+            .into_iter()
+            .map(|raw| {
+                if raw == self.spec.null_marker {
+                    Ok(None)
+                } else {
+                    self.decode_text_field(&raw).map(|v| Some(Bytes::from(v)))
+                }
+            })
+            .collect()
+    }
+
+    fn split_raw_fields(&self, line: &[u8]) -> Vec<Vec<u8>> {
+        let mut fields = Vec::new();
+        let mut current = Vec::new();
+        let mut escaped = false;
+
+        for byte in line {
+            if !escaped && *byte == self.spec.delimiter {
+                fields.push(current);
+                current = Vec::new();
+                continue;
+            }
+
+            current.push(*byte);
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            }
+        }
+
+        fields.push(current);
+        fields
+    }
+
+    fn decode_text_field(&self, raw: &[u8]) -> PgResult<Vec<u8>> {
+        let mut decoded = Vec::with_capacity(raw.len());
+        let mut idx = 0usize;
+
+        while idx < raw.len() {
+            let byte = raw[idx];
+            if byte != b'\\' {
+                decoded.push(byte);
+                idx += 1;
+                continue;
+            }
+
+            idx += 1;
+            if idx == raw.len() {
+                return Err(PedanticError::new(
+                    PgErrorCode::InvalidTextRepresentation,
+                    "COPY data ended inside an escape sequence",
+                )
+                .into());
+            }
+
+            let escaped = raw[idx];
+            let decoded_byte = match escaped {
+                b'b' => {
+                    idx += 1;
+                    b'\x08'
+                }
+                b'f' => {
+                    idx += 1;
+                    b'\x0c'
+                }
+                b'n' => {
+                    idx += 1;
+                    b'\n'
+                }
+                b'r' => {
+                    idx += 1;
+                    b'\r'
+                }
+                b't' => {
+                    idx += 1;
+                    b'\t'
+                }
+                b'v' => {
+                    idx += 1;
+                    b'\x0b'
+                }
+                b'\\' => {
+                    idx += 1;
+                    b'\\'
+                }
+                b'x' => {
+                    let Some(first) = raw.get(idx + 1).copied() else {
+                        return Err(PedanticError::new(
+                            PgErrorCode::InvalidTextRepresentation,
+                            "COPY data ended inside a hexadecimal escape sequence",
+                        )
+                        .into());
+                    };
+                    let Some(mut value) = hex_value(first) else {
+                        return Err(PedanticError::new(
+                            PgErrorCode::InvalidTextRepresentation,
+                            format!(
+                                "invalid COPY hexadecimal escape sequence: \\x{}",
+                                char::from(first)
+                            ),
+                        )
+                        .into());
+                    };
+
+                    idx += 2;
+                    if let Some(second) = raw.get(idx).copied().and_then(hex_value) {
+                        value = value * 16 + second;
+                        idx += 1;
+                    }
+                    value
+                }
+                b'0'..=b'7' => {
+                    let mut value = escaped - b'0';
+                    idx += 1;
+                    for _ in 0..2 {
+                        let Some(next) = raw.get(idx).copied() else {
+                            break;
+                        };
+                        if !(b'0'..=b'7').contains(&next) {
+                            break;
+                        }
+                        value = value.saturating_mul(8).saturating_add(next - b'0');
+                        idx += 1;
+                    }
+                    value
+                }
+                byte if byte == self.spec.delimiter => {
+                    idx += 1;
+                    self.spec.delimiter
+                }
+                other => {
+                    idx += 1;
+                    other
+                }
+            };
+
+            decoded.push(decoded_byte);
+        }
+
+        Ok(decoded)
+    }
+
+    fn ensure_schema_unchanged(&self) -> PgResult<()> {
+        let current = load_table_schema_version(&self.spec.table_name)?;
+        if current != self.spec.schema_version {
+            return Err(PgError::other(format!(
+                "COPY target table schema changed during execution: {}",
+                self.spec.table_name
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_rows(&self, backend: &Backend) -> PgResult<usize> {
+        if self.row_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        // TODO: replace the buffered single-statement INSERT synthesis with a dedicated
+        // COPY apply path once COPY grows beyond the current strict single-node MVP.
+        let statement_id = COPY_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let statement_name = format!("__pico_copy_stmt_{statement_id}");
+        let portal_name = format!("__pico_copy_portal_{statement_id}");
+        let sql = self.spec.build_insert_sql(self.row_buffer.len());
+
+        let mut params = Vec::with_capacity(self.row_buffer.len() * self.spec.field_count);
+        for row in &self.row_buffer {
+            params.extend(row.iter().cloned());
+        }
+
+        let result = (|| {
+            backend.parse(Some(statement_name.clone()), &sql, vec![])?;
+            backend.bind(
+                Some(statement_name.clone()),
+                Some(portal_name.clone()),
+                params,
+                &[COPY_TEXT_FORMAT],
+                &[COPY_TEXT_FORMAT],
+            )?;
+
+            match backend.execute(Some(portal_name.clone()), -1)? {
+                ExecuteResult::Dml { row_count, .. } => Ok(row_count),
+                _ => Err(PgError::other("unexpected COPY execution result kind")),
+            }
+        })();
+
+        backend.close_portal(Some(&portal_name));
+        backend.close_statement(Some(&statement_name));
+        result
+    }
+}
 
 fn parse_copy_delimiter(delimiter: &str) -> PgResult<u8> {
     let mut bytes = delimiter.as_bytes().iter().copied();
@@ -95,6 +407,186 @@ fn copy_format_name(format: CopyFormat) -> &'static str {
     }
 }
 
+fn find_line_end(data: &[u8]) -> Option<(usize, usize)> {
+    let mut idx = 0usize;
+    while idx < data.len() {
+        match data[idx] {
+            b'\n' => {
+                return Some((
+                    if idx > 0 && data[idx - 1] == b'\r' {
+                        idx - 1
+                    } else {
+                        idx
+                    },
+                    1,
+                ));
+            }
+            b'\r' => {
+                if idx + 1 < data.len() {
+                    let line_ending_len = if data[idx + 1] == b'\n' { 2 } else { 1 };
+                    return Some((idx, line_ending_len));
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn split_top_level_dot(name: &str) -> Option<usize> {
+    let bytes = name.as_bytes();
+    let mut idx = 0usize;
+    let mut in_quotes = false;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'"' => {
+                if in_quotes && bytes.get(idx + 1) == Some(&b'"') {
+                    idx += 2;
+                    continue;
+                }
+                in_quotes = !in_quotes;
+            }
+            b'.' if !in_quotes => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn normalize_table_name(name: &str) -> PgResult<SmolStr> {
+    if let Some(dot_idx) = split_top_level_dot(name) {
+        let schema_name = normalize_name_from_sql(&name[..dot_idx]);
+        if schema_name != "public" {
+            return Err(PgError::FeatureNotSupported(format_smolstr!(
+                "COPY FROM STDIN currently supports only the public schema"
+            )));
+        }
+        Ok(normalize_name_from_sql(&name[dot_idx + 1..]))
+    } else {
+        Ok(normalize_name_from_sql(name))
+    }
+}
+
+fn sql_quote_identifier(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn default_copy_columns(table_def: &TableDef) -> Vec<String> {
+    let skip_implicit_bucket_id = matches!(table_def.distribution, Distribution::ShardedImplicitly { .. });
+
+    table_def
+        .format
+        .iter()
+        .filter(|field| {
+            !(skip_implicit_bucket_id && field.name.as_str() == DEFAULT_BUCKET_ID_COLUMN_NAME)
+        })
+        .map(|field| sql_quote_identifier(&field.name))
+        .collect()
+}
+
+fn resolve_copy_spec(spec: CopySpec) -> PgResult<ResolvedCopySpec> {
+    let storage = Catalog::try_get(false).expect("storage should be initialized");
+    let table_name = normalize_table_name(&spec.table_name)?;
+    let table_def = with_su(ADMIN_ID, || storage.pico_table.by_name(&table_name))??
+        .ok_or_else(|| PgError::other(format!("table does not exist: {}", spec.table_name)))?;
+
+    let columns_sql = if spec.columns.is_empty() {
+        default_copy_columns(&table_def)
+    } else {
+        let mut columns = Vec::with_capacity(spec.columns.len());
+        for column in &spec.columns {
+            let column_name = normalize_name_from_sql(column);
+            let field = table_def
+                .format
+                .iter()
+                .find(|field| field.name == column_name)
+                .ok_or_else(|| PgError::other(format!("column does not exist: {column}")))?;
+            columns.push(sql_quote_identifier(&field.name));
+        }
+        columns
+    };
+
+    let table_name_sql = sql_quote_identifier(&table_def.name);
+
+    Ok(ResolvedCopySpec {
+        table_name: table_def.name,
+        table_sql: table_name_sql,
+        field_count: columns_sql.len(),
+        columns_sql,
+        delimiter: spec.delimiter,
+        null_marker: spec.null_marker,
+        header: spec.header,
+        schema_version: table_def.schema_version,
+    })
+}
+
+fn load_table_schema_version(table_name: &SmolStr) -> PgResult<u64> {
+    let storage = Catalog::try_get(false).expect("storage should be initialized");
+    let table_def = with_su(ADMIN_ID, || storage.pico_table.by_name(table_name))??
+        .ok_or_else(|| PgError::other(format!("table does not exist: {table_name}")))?;
+    Ok(table_def.schema_version)
+}
+
+pub fn start_copy(backend: &Backend, spec: CopySpec) -> PgResult<CopyStart> {
+    backend.ensure_single_node_topology()?;
+    let resolved = resolve_copy_spec(spec)?;
+    let start = CopyStart {
+        column_count: resolved.field_count,
+    };
+
+    COPY_SESSIONS.with(|storage| {
+        let prev = storage
+            .borrow_mut()
+            .insert(backend.client_id(), CopySession::new(resolved));
+        if prev.is_some() {
+            return Err(PgError::other("COPY session already exists"));
+        }
+        Ok(start)
+    })
+}
+
+pub fn on_copy_data(backend: &Backend, data: Bytes) -> PgResult<()> {
+    COPY_SESSIONS.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        let session = storage.get_mut(&backend.client_id()).ok_or_else(|| {
+            PgError::ProtocolViolation(format_smolstr!("COPY session is missing"))
+        })?;
+        session.on_copy_data(data)
+    })
+}
+
+pub fn on_copy_done(backend: &Backend) -> PgResult<usize> {
+    COPY_SESSIONS.with(|storage| {
+        let session = storage
+            .borrow_mut()
+            .remove(&backend.client_id())
+            .ok_or_else(|| {
+                PgError::ProtocolViolation(format_smolstr!("COPY session is missing"))
+            })?;
+        session.on_copy_done(backend)
+    })
+}
+
+pub fn abort_copy(backend: &Backend) {
+    COPY_SESSIONS.with(|storage| {
+        storage.borrow_mut().remove(&backend.client_id());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +602,20 @@ mod tests {
         CopySpec::try_from_statement(statement)
     }
 
+    fn decode_session(sql: &str) -> CopySession {
+        let spec = parse_spec(sql).expect("spec");
+        CopySession::new(ResolvedCopySpec {
+            table_name: "t".into(),
+            table_sql: r#""t""#.into(),
+            columns_sql: vec![r#""value""#.into()],
+            field_count: 1,
+            delimiter: spec.delimiter,
+            null_marker: spec.null_marker,
+            header: spec.header,
+            schema_version: 0,
+        })
+    }
+
     #[test]
     fn parses_supported_copy_spec() {
         let spec = parse_spec(
@@ -121,5 +627,25 @@ mod tests {
         assert_eq!(spec.delimiter, b'|');
         assert_eq!(spec.null_marker, b"nil");
         assert!(spec.header);
+    }
+
+    #[test]
+    fn decodes_postgres_text_escapes() {
+        let session = decode_session(r#"COPY "t" FROM STDIN"#);
+        assert_eq!(
+            session
+                .decode_text_field(br#"hello\\world\tok\n\141\x42"#)
+                .expect("decode"),
+            b"hello\\world\tok\naB"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_escape() {
+        let session = decode_session(r#"COPY "t" FROM STDIN"#);
+        let err = session
+            .decode_text_field(br#"broken\"#)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("ended inside an escape sequence"));
     }
 }
