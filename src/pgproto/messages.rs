@@ -2,6 +2,7 @@ use super::backend::describe::CommandTag;
 use super::stream::BeMessage;
 use bytes::Bytes;
 use pgwire::error::ErrorInfo;
+use pgwire::messages::copy::CopyInResponse;
 use pgwire::messages::data::{self, DataRow, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,
@@ -81,6 +82,10 @@ pub fn command_complete_with_row_count(tag: &CommandTag, row_count: usize) -> Be
     BeMessage::CommandComplete(response::CommandComplete::new(tag))
 }
 
+pub fn copy_command_complete(row_count: usize) -> BeMessage {
+    BeMessage::CommandComplete(response::CommandComplete::new(format!("COPY {row_count}")))
+}
+
 /// RowDescription defines gow to parse the following DataRow messages.
 pub fn row_description(row_description: RowDescription) -> BeMessage {
     BeMessage::RowDescription(row_description)
@@ -121,4 +126,12 @@ pub fn close_complete() -> BeMessage {
 
 pub fn parameter_description(type_ids: Vec<Oid>) -> BeMessage {
     BeMessage::ParameterDescription(ParameterDescription::new(type_ids))
+}
+
+pub fn copy_in_response_text(column_count: usize) -> BeMessage {
+    BeMessage::CopyInResponse(CopyInResponse::new(
+        0,
+        column_count as i16,
+        vec![0; column_count],
+    ))
 }

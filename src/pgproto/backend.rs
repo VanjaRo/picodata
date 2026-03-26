@@ -1,7 +1,7 @@
 use self::{
     describe::{PortalDescribe, StatementDescribe},
     result::ExecuteResult,
-    storage::{Portal, Statement, PG_PORTALS, PG_STATEMENTS},
+    storage::{Portal, PortalSource, Statement, StatementKind, PG_PORTALS, PG_STATEMENTS},
 };
 use super::{
     client::{ClientId, ClientParams},
@@ -14,12 +14,13 @@ use crate::tlog;
 use crate::{
     pgproto::value::{FieldFormat, RawFormat},
     schema::ADMIN_ID,
+    storage::ToEntryIter,
 };
 use bytes::Bytes;
 use postgres_types::Oid;
 use smol_str::format_smolstr;
 use sql::ir::value::Value as SbroadValue;
-use sql::PreparedStatement;
+use sql::PreparedCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage::param_oid_to_derived_type;
 use tarantool::session::with_su;
@@ -27,6 +28,7 @@ use tarantool::session::with_su;
 mod pgproc;
 mod well_known_queries;
 
+pub mod copy;
 pub mod describe;
 pub mod result;
 pub mod storage;
@@ -112,17 +114,24 @@ pub fn bind(
     };
     let effective_options = client_params.execution_options().unwrap_or(sql_options);
 
-    let bound_statement = statement
-        .prepared_statement()
-        .bind(params, effective_options)?;
+    let source = match statement.statement_kind() {
+        StatementKind::Sql(prepared_statement) => {
+            PortalSource::Sql(prepared_statement.bind(params, effective_options)?)
+        }
+        StatementKind::Copy(spec) => {
+            if !params.is_empty() {
+                return Err(PgError::ProtocolViolation(format_smolstr!(
+                    "bind message supplies {} parameters, but prepared statement \"{}\" requires 0",
+                    params.len(),
+                    statement_key.1,
+                )));
+            }
+            PortalSource::Copy(spec.clone())
+        }
+    };
 
     let portal_key = storage::Key(id, portal_name.into());
-    let portal = Portal::new(
-        portal_key.clone(),
-        statement.clone(),
-        result_format,
-        bound_statement,
-    )?;
+    let portal = Portal::new(portal_key.clone(), statement.clone(), result_format, source)?;
     PG_PORTALS.with(|storage| storage.borrow_mut().put(portal_key, portal))?;
 
     Ok(())
@@ -151,9 +160,15 @@ pub fn parse(id: ClientId, name: String, query: &str, param_oids: Vec<Oid>) -> P
         .map(|oid| param_oid_to_derived_type(*oid))
         .collect::<Result<_, _>>()?;
 
-    let prepared_statement = PreparedStatement::parse(&router, query, &param_types)?;
-
-    let statement = Statement::new(key.clone(), prepared_statement, param_oids)?;
+    let statement = match PreparedCommand::parse(&router, query, &param_types)? {
+        PreparedCommand::Copy(copy_statement) => Statement::new_copy(
+            key.clone(),
+            copy::CopySpec::try_from_statement(copy_statement)?,
+        ),
+        PreparedCommand::Sql(prepared_statement) => {
+            Statement::new_sql(key.clone(), prepared_statement, param_oids)?
+        }
+    };
     PG_STATEMENTS.with(|storage| storage.borrow_mut().put(key, statement.into()))?;
 
     Ok(())
@@ -375,7 +390,13 @@ impl Backend {
     /// non-dql queries max_rows is ignored and result with no rows is returned.
     pub fn execute(&self, portal: Option<String>, max_rows: i64) -> PgResult<ExecuteResult> {
         let name = portal.unwrap_or_default();
-        execute(self.client_id, name, max_rows)
+        match execute(self.client_id, name, max_rows)? {
+            ExecuteResult::CopyInStartRequested { spec } => {
+                let start = copy::start_copy(self, spec)?;
+                Ok(ExecuteResult::CopyInStart { start })
+            }
+            result => Ok(result),
+        }
     }
 
     /// Handler for a Close message.
@@ -399,7 +420,33 @@ impl Backend {
         close_client_portals(self.client_id)
     }
 
+    pub fn on_copy_data(&self, data: Bytes) -> PgResult<()> {
+        copy::on_copy_data(self, data)
+    }
+
+    pub fn on_copy_done(&self) -> PgResult<usize> {
+        copy::on_copy_done(self)
+    }
+
+    pub fn abort_copy(&self) {
+        copy::abort_copy(self)
+    }
+
+    /// COPY FROM STDIN is intentionally restricted to a single-node topology.
+    pub fn ensure_single_node_topology(&self) -> PgResult<()> {
+        let node = crate::traft::node::global()?;
+        let replicaset_count = node.storage.replicasets.iter()?.count();
+        let instance_count = node.storage.instances.iter()?.count();
+        if replicaset_count != 1 || instance_count != 1 {
+            return Err(PgError::FeatureNotSupported(format_smolstr!(
+                "COPY FROM STDIN is available only for single-node clusters",
+            )));
+        }
+        Ok(())
+    }
+
     fn on_disconnect(&self) {
+        self.abort_copy();
         close_client_statements(self.client_id);
         close_client_portals(self.client_id);
     }

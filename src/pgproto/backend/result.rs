@@ -1,4 +1,8 @@
-use crate::pgproto::{backend::describe::CommandTag, error::EncodingError, value::PgValue};
+use crate::pgproto::{
+    backend::{copy::CopySpec, describe::CommandTag},
+    error::EncodingError,
+    value::PgValue,
+};
 use pgwire::{
     api::results::{DataRowEncoder, FieldInfo},
     messages::data::{DataRow, RowDescription},
@@ -90,6 +94,17 @@ pub enum ExecuteResult {
         /// necessary to cache the number of rows before retrieving them.
         row_count: usize,
     },
+    CopyInStartRequested {
+        spec: CopySpec,
+    },
+    CopyInStart {
+        start: CopyStart,
+    },
     /// Result of an empty query.
     Empty,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyStart {
+    pub column_count: usize,
 }
