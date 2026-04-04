@@ -115,69 +115,141 @@ impl ResolvedCopySpec {
 struct CopySession {
     spec: ResolvedCopySpec,
     skipped_header: bool,
-    pending_data: Vec<u8>,
+    record_reader: TextRecordReader,
+    row_parser: TextRowParser,
     row_buffer: Vec<Vec<Option<Bytes>>>,
 }
 
 impl CopySession {
     fn new(spec: ResolvedCopySpec) -> Self {
+        let row_parser =
+            TextRowParser::new(spec.delimiter, spec.null_marker.clone(), spec.field_count);
         Self {
             spec,
             skipped_header: false,
-            pending_data: Vec::new(),
+            record_reader: TextRecordReader::new(),
+            row_parser,
             row_buffer: Vec::new(),
         }
     }
 
     fn on_copy_data(&mut self, data: Bytes) -> PgResult<()> {
-        self.pending_data.extend_from_slice(data.as_ref());
+        self.record_reader.push(data.as_ref());
 
-        while let Some((line_end, line_ending_len)) = find_line_end(&self.pending_data) {
-            let line = self.pending_data[..line_end].to_vec();
-            self.pending_data.drain(0..line_end + line_ending_len);
-            self.process_line(&line)?;
+        while let Some(record) = self.record_reader.next_record() {
+            self.process_record(&record)?;
         }
 
         Ok(())
     }
 
     fn on_copy_done(mut self, backend: &Backend) -> PgResult<usize> {
-        self.finish_pending_line()?;
+        if let Some(record) = self.record_reader.finish_record() {
+            self.process_record(&record)?;
+        }
         self.ensure_schema_unchanged()?;
         self.apply_rows(backend)
     }
 
-    fn process_line(&mut self, line: &[u8]) -> PgResult<()> {
+    fn process_record(&mut self, record: &[u8]) -> PgResult<()> {
         if self.spec.header && !self.skipped_header {
             self.skipped_header = true;
             return Ok(());
         }
 
-        self.row_buffer.push(self.parse_row(line)?);
+        self.row_buffer.push(self.row_parser.parse_record(record)?);
         Ok(())
     }
 
-    fn finish_pending_line(&mut self) -> PgResult<()> {
-        if self.pending_data.is_empty() {
-            return Ok(());
+    fn ensure_schema_unchanged(&self) -> PgResult<()> {
+        let current = load_table_schema_version(&self.spec.table_name)?;
+        if current != self.spec.schema_version {
+            return Err(PgError::other(format!(
+                "COPY target table schema changed during execution: {}",
+                self.spec.table_name
+            )));
         }
-
-        let mut line = std::mem::take(&mut self.pending_data);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        self.process_line(&line)
+        Ok(())
     }
 
-    fn parse_row(&self, line: &[u8]) -> PgResult<Vec<Option<Bytes>>> {
-        let fields = self.split_raw_fields(line);
-        if fields.len() != self.spec.field_count {
+    fn apply_rows(&self, backend: &Backend) -> PgResult<usize> {
+        if self.row_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        // TODO: replace the buffered single-statement INSERT synthesis with a dedicated
+        // COPY apply path once COPY grows beyond the current strict single-node MVP.
+        let sql = self.spec.build_insert_sql(self.row_buffer.len());
+
+        let mut params = Vec::with_capacity(self.row_buffer.len() * self.spec.field_count);
+        for row in &self.row_buffer {
+            params.extend(row.iter().cloned());
+        }
+
+        let bound = backend.bind_sql_statement(&sql, params)?;
+        let router = crate::sql::router::RouterRuntime::new();
+        super::storage::execute_bound_dml(&router, bound)
+    }
+}
+
+#[derive(Default)]
+struct TextRecordReader {
+    pending: Vec<u8>,
+}
+
+impl TextRecordReader {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+    }
+
+    fn next_record(&mut self) -> Option<Vec<u8>> {
+        let (line_end, line_ending_len) = find_line_end(&self.pending)?;
+        let record = self.pending[..line_end].to_vec();
+        self.pending.drain(0..line_end + line_ending_len);
+        Some(record)
+    }
+
+    fn finish_record(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        let mut record = std::mem::take(&mut self.pending);
+        if record.last() == Some(&b'\r') {
+            record.pop();
+        }
+        Some(record)
+    }
+}
+
+struct TextRowParser {
+    delimiter: u8,
+    null_marker: Vec<u8>,
+    field_count: usize,
+}
+
+impl TextRowParser {
+    fn new(delimiter: u8, null_marker: Vec<u8>, field_count: usize) -> Self {
+        Self {
+            delimiter,
+            null_marker,
+            field_count,
+        }
+    }
+
+    fn parse_record(&self, record: &[u8]) -> PgResult<Vec<Option<Bytes>>> {
+        let fields = self.split_raw_fields(record);
+        if fields.len() != self.field_count {
             return Err(PedanticError::new(
                 PgErrorCode::InvalidTextRepresentation,
                 format!(
                     "COPY row has {} columns but expected {}",
                     fields.len(),
-                    self.spec.field_count
+                    self.field_count
                 ),
             )
             .into());
@@ -186,7 +258,7 @@ impl CopySession {
         fields
             .into_iter()
             .map(|raw| {
-                if raw == self.spec.null_marker {
+                if raw == self.null_marker {
                     Ok(None)
                 } else {
                     self.decode_text_field(&raw).map(|v| Some(Bytes::from(v)))
@@ -195,13 +267,13 @@ impl CopySession {
             .collect()
     }
 
-    fn split_raw_fields(&self, line: &[u8]) -> Vec<Vec<u8>> {
+    fn split_raw_fields(&self, record: &[u8]) -> Vec<Vec<u8>> {
         let mut fields = Vec::new();
         let mut current = Vec::new();
         let mut escaped = false;
 
-        for byte in line {
-            if !escaped && *byte == self.spec.delimiter {
+        for byte in record {
+            if !escaped && *byte == self.delimiter {
                 fields.push(current);
                 current = Vec::new();
                 continue;
@@ -311,9 +383,9 @@ impl CopySession {
                     }
                     value
                 }
-                byte if byte == self.spec.delimiter => {
+                byte if byte == self.delimiter => {
                     idx += 1;
-                    self.spec.delimiter
+                    self.delimiter
                 }
                 other => {
                     idx += 1;
@@ -325,36 +397,6 @@ impl CopySession {
         }
 
         Ok(decoded)
-    }
-
-    fn ensure_schema_unchanged(&self) -> PgResult<()> {
-        let current = load_table_schema_version(&self.spec.table_name)?;
-        if current != self.spec.schema_version {
-            return Err(PgError::other(format!(
-                "COPY target table schema changed during execution: {}",
-                self.spec.table_name
-            )));
-        }
-        Ok(())
-    }
-
-    fn apply_rows(&self, backend: &Backend) -> PgResult<usize> {
-        if self.row_buffer.is_empty() {
-            return Ok(0);
-        }
-
-        // TODO: replace the buffered single-statement INSERT synthesis with a dedicated
-        // COPY apply path once COPY grows beyond the current strict single-node MVP.
-        let sql = self.spec.build_insert_sql(self.row_buffer.len());
-
-        let mut params = Vec::with_capacity(self.row_buffer.len() * self.spec.field_count);
-        for row in &self.row_buffer {
-            params.extend(row.iter().cloned());
-        }
-
-        let bound = backend.bind_sql_statement(&sql, params)?;
-        let router = crate::sql::router::RouterRuntime::new();
-        super::storage::execute_bound_dml(&router, bound)
     }
 }
 
@@ -564,18 +606,9 @@ mod tests {
         CopySpec::try_from_statement(statement)
     }
 
-    fn decode_session(sql: &str) -> CopySession {
+    fn decode_row_parser(sql: &str) -> TextRowParser {
         let spec = parse_spec(sql).expect("spec");
-        CopySession::new(ResolvedCopySpec {
-            table_name: "t".into(),
-            table_sql: r#""t""#.into(),
-            columns_sql: vec![r#""value""#.into()],
-            field_count: 1,
-            delimiter: spec.delimiter,
-            null_marker: spec.null_marker,
-            header: spec.header,
-            schema_version: 0,
-        })
+        TextRowParser::new(spec.delimiter, spec.null_marker, 1)
     }
 
     #[test]
@@ -593,9 +626,9 @@ mod tests {
 
     #[test]
     fn decodes_postgres_text_escapes() {
-        let session = decode_session(r#"COPY "t" FROM STDIN"#);
+        let parser = decode_row_parser(r#"COPY "t" FROM STDIN"#);
         assert_eq!(
-            session
+            parser
                 .decode_text_field(br#"hello\\world\tok\n\141\x42"#)
                 .expect("decode"),
             b"hello\\world\tok\naB"
@@ -604,10 +637,43 @@ mod tests {
 
     #[test]
     fn rejects_trailing_escape() {
-        let session = decode_session(r#"COPY "t" FROM STDIN"#);
-        let err = session
+        let parser = decode_row_parser(r#"COPY "t" FROM STDIN"#);
+        let err = parser
             .decode_text_field(br#"broken\"#)
             .expect_err("must fail");
         assert!(err.to_string().contains("ended inside an escape sequence"));
+    }
+
+    #[test]
+    fn text_record_reader_keeps_partial_record_across_messages() {
+        let mut reader = TextRecordReader::new();
+        reader.push(b"1\tal");
+        assert!(reader.next_record().is_none());
+
+        reader.push(b"pha\n2\tbeta\n");
+        assert_eq!(reader.next_record().expect("first"), b"1\talpha");
+        assert_eq!(reader.next_record().expect("second"), b"2\tbeta");
+        assert!(reader.next_record().is_none());
+    }
+
+    #[test]
+    fn text_record_reader_finishes_tail_record_without_newline() {
+        let mut reader = TextRecordReader::new();
+        reader.push(b"1\talpha\r");
+        assert!(reader.next_record().is_none());
+        assert_eq!(reader.finish_record().expect("tail"), b"1\talpha");
+        assert!(reader.finish_record().is_none());
+    }
+
+    #[test]
+    fn text_record_reader_handles_crlf_split_across_messages() {
+        let mut reader = TextRecordReader::new();
+        reader.push(b"1\talpha\r");
+        assert!(reader.next_record().is_none());
+
+        reader.push(b"\n2\tbeta\n");
+        assert_eq!(reader.next_record().expect("first"), b"1\talpha");
+        assert_eq!(reader.next_record().expect("second"), b"2\tbeta");
+        assert!(reader.next_record().is_none());
     }
 }
