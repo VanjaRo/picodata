@@ -157,6 +157,44 @@ def test_copy_text_with_crlf_and_final_line_without_newline(postgres: Postgres):
         assert rows == [(1, "alpha"), (2, "beta")]
 
 
+def test_copy_text_escaped_physical_newline(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_escaped_newline")
+
+        with conn.cursor() as cur:
+            with cur.copy('COPY "copy_escaped_newline" ("id", "value") FROM STDIN') as copy:
+                copy.write("1\thello\\\nworld\n")
+            assert cur.statusmessage == "COPY 1"
+
+        rows = conn.execute('SELECT "id", "value" FROM "copy_escaped_newline" ORDER BY "id"').fetchall()
+        assert rows == [(1, "hello\nworld")]
+
+
+def test_copy_text_treats_backslash_dot_as_data(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_backslash_dot")
+
+        with conn.cursor() as cur:
+            with cur.copy('COPY "copy_backslash_dot" ("id", "value") FROM STDIN') as copy:
+                copy.write("1\t\\.\n")
+            assert cur.statusmessage == "COPY 1"
+
+        rows = conn.execute('SELECT "id", "value" FROM "copy_backslash_dot" ORDER BY "id"').fetchall()
+        assert rows == [(1, ".")]
+
+
+def test_copy_text_rejects_mixed_line_endings(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_mixed_line_endings")
+
+        with pytest.raises(psycopg.Error, match="mixed line endings"):
+            with conn.cursor() as cur:
+                with cur.copy('COPY "copy_mixed_line_endings" ("id", "value") FROM STDIN') as copy:
+                    copy.write("1\talpha\n2\tbeta\r\n")
+
+        assert count_rows(conn, "copy_mixed_line_endings") == 0
+
+
 def test_copy_empty_string_is_not_null(postgres: Postgres):
     with connect_admin(postgres) as conn:
         create_test_table(conn, "copy_empty_string")

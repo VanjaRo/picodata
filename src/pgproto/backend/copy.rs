@@ -136,7 +136,7 @@ impl CopySession {
     fn on_copy_data(&mut self, data: Bytes) -> PgResult<()> {
         self.record_reader.push(data.as_ref());
 
-        while let Some(record) = self.record_reader.next_record() {
+        while let Some(record) = self.record_reader.next_record()? {
             self.process_record(&record)?;
         }
 
@@ -144,7 +144,7 @@ impl CopySession {
     }
 
     fn on_copy_done(mut self, backend: &Backend) -> PgResult<usize> {
-        if let Some(record) = self.record_reader.finish_record() {
+        if let Some(record) = self.record_reader.finish_record()? {
             self.process_record(&record)?;
         }
         self.ensure_schema_unchanged()?;
@@ -195,6 +195,7 @@ impl CopySession {
 #[derive(Default)]
 struct TextRecordReader {
     pending: Vec<u8>,
+    eol_style: EolStyle,
 }
 
 impl TextRecordReader {
@@ -206,23 +207,68 @@ impl TextRecordReader {
         self.pending.extend_from_slice(bytes);
     }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
-        let (line_end, line_ending_len) = find_line_end(&self.pending)?;
+    fn next_record(&mut self) -> PgResult<Option<Vec<u8>>> {
+        let Some((line_end, line_ending_len, eol_style)) = find_record_end(&self.pending) else {
+            return Ok(None);
+        };
+        self.register_eol(eol_style)?;
         let record = self.pending[..line_end].to_vec();
         self.pending.drain(0..line_end + line_ending_len);
-        Some(record)
+        Ok(Some(record))
     }
 
-    fn finish_record(&mut self) -> Option<Vec<u8>> {
+    fn finish_record(&mut self) -> PgResult<Option<Vec<u8>>> {
         if self.pending.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut record = std::mem::take(&mut self.pending);
-        if record.last() == Some(&b'\r') {
+        if ends_with_unescaped_cr(&record) {
+            self.register_eol(EolStyle::Cr)?;
             record.pop();
         }
-        Some(record)
+        Ok(Some(record))
+    }
+
+    fn register_eol(&mut self, eol_style: EolStyle) -> PgResult<()> {
+        if matches!(self.eol_style, EolStyle::Unknown) {
+            self.eol_style = eol_style;
+            return Ok(());
+        }
+
+        if self.eol_style == eol_style {
+            return Ok(());
+        }
+
+        Err(PedanticError::new(
+            PgErrorCode::InvalidTextRepresentation,
+            format!(
+                "COPY data has mixed line endings: expected {} but found {}",
+                self.eol_style.name(),
+                eol_style.name()
+            ),
+        )
+        .into())
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum EolStyle {
+    #[default]
+    Unknown,
+    Lf,
+    Cr,
+    CrLf,
+}
+
+impl EolStyle {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Lf => "LF",
+            Self::Cr => "CR",
+            Self::CrLf => "CRLF",
+        }
     }
 }
 
@@ -423,24 +469,36 @@ fn copy_format_name(format: CopyFormat) -> &'static str {
     }
 }
 
-fn find_line_end(data: &[u8]) -> Option<(usize, usize)> {
+fn find_record_end(data: &[u8]) -> Option<(usize, usize, EolStyle)> {
     let mut idx = 0usize;
+    let mut escaped = false;
     while idx < data.len() {
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
         match data[idx] {
+            b'\\' => {
+                escaped = true;
+            }
             b'\n' => {
-                return Some((
-                    if idx > 0 && data[idx - 1] == b'\r' {
-                        idx - 1
-                    } else {
-                        idx
-                    },
-                    1,
-                ));
+                return Some((idx, 1, EolStyle::Lf));
             }
             b'\r' => {
                 if idx + 1 < data.len() {
-                    let line_ending_len = if data[idx + 1] == b'\n' { 2 } else { 1 };
-                    return Some((idx, line_ending_len));
+                    let eol_style = if data[idx + 1] == b'\n' {
+                        EolStyle::CrLf
+                    } else {
+                        EolStyle::Cr
+                    };
+                    let line_ending_len = if matches!(eol_style, EolStyle::CrLf) {
+                        2
+                    } else {
+                        1
+                    };
+                    return Some((idx, line_ending_len, eol_style));
                 }
             }
             _ => {}
@@ -448,6 +506,27 @@ fn find_line_end(data: &[u8]) -> Option<(usize, usize)> {
         idx += 1;
     }
     None
+}
+
+fn ends_with_unescaped_cr(data: &[u8]) -> bool {
+    if data.last() != Some(&b'\r') {
+        return false;
+    }
+
+    let mut escaped = false;
+    for (idx, byte) in data.iter().enumerate() {
+        if idx == data.len() - 1 {
+            return !escaped;
+        }
+
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        }
+    }
+
+    false
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -648,32 +727,85 @@ mod tests {
     fn text_record_reader_keeps_partial_record_across_messages() {
         let mut reader = TextRecordReader::new();
         reader.push(b"1\tal");
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().expect("partial").is_none());
 
         reader.push(b"pha\n2\tbeta\n");
-        assert_eq!(reader.next_record().expect("first"), b"1\talpha");
-        assert_eq!(reader.next_record().expect("second"), b"2\tbeta");
-        assert!(reader.next_record().is_none());
+        assert_eq!(
+            reader.next_record().expect("first record").expect("first"),
+            b"1\talpha"
+        );
+        assert_eq!(
+            reader
+                .next_record()
+                .expect("second record")
+                .expect("second"),
+            b"2\tbeta"
+        );
+        assert!(reader.next_record().expect("drained").is_none());
     }
 
     #[test]
     fn text_record_reader_finishes_tail_record_without_newline() {
         let mut reader = TextRecordReader::new();
         reader.push(b"1\talpha\r");
-        assert!(reader.next_record().is_none());
-        assert_eq!(reader.finish_record().expect("tail"), b"1\talpha");
-        assert!(reader.finish_record().is_none());
+        assert!(reader.next_record().expect("partial").is_none());
+        assert_eq!(
+            reader.finish_record().expect("tail record").expect("tail"),
+            b"1\talpha"
+        );
+        assert!(reader.finish_record().expect("drained").is_none());
     }
 
     #[test]
     fn text_record_reader_handles_crlf_split_across_messages() {
         let mut reader = TextRecordReader::new();
         reader.push(b"1\talpha\r");
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().expect("partial").is_none());
 
-        reader.push(b"\n2\tbeta\n");
-        assert_eq!(reader.next_record().expect("first"), b"1\talpha");
-        assert_eq!(reader.next_record().expect("second"), b"2\tbeta");
-        assert!(reader.next_record().is_none());
+        reader.push(b"\n2\tbeta\r\n");
+        assert_eq!(
+            reader.next_record().expect("first record").expect("first"),
+            b"1\talpha"
+        );
+        assert_eq!(
+            reader
+                .next_record()
+                .expect("second record")
+                .expect("second"),
+            b"2\tbeta"
+        );
+        assert!(reader.next_record().expect("drained").is_none());
+    }
+
+    #[test]
+    fn text_record_reader_treats_backslash_newline_as_data() {
+        let mut reader = TextRecordReader::new();
+        reader.push(b"1\thello\\\nworld\n2\tbeta\n");
+        assert_eq!(
+            reader.next_record().expect("first record").expect("first"),
+            b"1\thello\\\nworld"
+        );
+        assert_eq!(
+            reader
+                .next_record()
+                .expect("second record")
+                .expect("second"),
+            b"2\tbeta"
+        );
+        assert!(reader.next_record().expect("drained").is_none());
+    }
+
+    #[test]
+    fn text_record_reader_rejects_mixed_line_endings() {
+        let mut reader = TextRecordReader::new();
+        reader.push(b"1\talpha\n2\tbeta\r\n");
+        assert_eq!(
+            reader.next_record().expect("first record").expect("first"),
+            b"1\talpha"
+        );
+        let err = reader
+            .next_record()
+            .expect_err("mixed line endings must fail");
+        assert!(err.to_string().contains("mixed line endings"));
     }
 }
