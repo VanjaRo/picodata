@@ -91,6 +91,30 @@ def test_copy_text_crlf_split_across_copydata_messages(postgres: Postgres):
         assert rows == [(1, "alpha"), (2, "beta")]
 
 
+def test_copy_text_escaped_newline_split_across_copydata_messages(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_escaped_newline_split")
+
+    sock = _startup_copy_session(postgres, "copy_proto_escaped_newline_split")
+    try:
+        send_copy_data_message(sock, b"1\thello\\")
+        send_copy_data_message(sock, b"\nworld\n")
+        send_copy_done(sock)
+
+        messages = recv_until_ready(sock)
+        message_types = [message_type for message_type, _ in messages]
+        assert message_types[-2:] == [b"C", b"Z"]
+        assert messages[-2][1].startswith(b"COPY 1\x00")
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        rows = conn.execute(
+            'SELECT "id", "value" FROM "copy_proto_escaped_newline_split" ORDER BY "id"'
+        ).fetchall()
+        assert rows == [(1, "hello\nworld")]
+
+
 def test_copy_extended_query_success_sequence(postgres: Postgres):
     create_test_table_via_instance(postgres, "copy_proto_extended")
 

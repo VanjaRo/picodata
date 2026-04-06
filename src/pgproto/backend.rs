@@ -425,29 +425,6 @@ impl Backend {
         copy::abort_copy(self)
     }
 
-    pub(crate) fn bind_sql_statement(
-        &self,
-        sql: &str,
-        params: Vec<Option<Bytes>>,
-    ) -> PgResult<sql::BoundStatement> {
-        let router = RouterRuntime::new();
-        let prepared = sql::PreparedStatement::parse(&router, sql, &[])?;
-        let inferred_types = prepared.collect_parameter_types();
-        let param_oids = storage::collect_param_oids(&inferred_types, &[]);
-        let params = decode_parameters(
-            params,
-            &param_oids,
-            &vec![FieldFormat::Text; param_oids.len()],
-            sql,
-        )?;
-
-        let Some(sql_options) = DYNAMIC_CONFIG.current_sql_options() else {
-            return Err(PgError::other("Not initialized yet"));
-        };
-        let effective_options = self.params.execution_options().unwrap_or(sql_options);
-        prepared.bind(params, effective_options).map_err(Into::into)
-    }
-
     fn on_disconnect(&self) {
         self.abort_copy();
         close_client_statements(self.client_id);

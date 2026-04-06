@@ -65,6 +65,7 @@ pub struct CopyOptions {
     pub delimiter: Option<String>,
     pub null_string: Option<String>,
     pub header: bool,
+    pub batch_size: Option<usize>,
 }
 
 impl Default for CopyOptions {
@@ -74,6 +75,7 @@ impl Default for CopyOptions {
             delimiter: None,
             null_string: None,
             header: false,
+            batch_size: None,
         }
     }
 }
