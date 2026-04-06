@@ -2,6 +2,10 @@ use crate::metrics::{
     report_storage_cache_hit, report_storage_cache_miss, STORAGE_2ND_REQUESTS_TOTAL,
 };
 use crate::preemption::scheduler_options;
+use crate::sql::direct_insert::{
+    apply_insert_with_conflict, determine_insert_bucket_id, ensure_target_space,
+    find_insert_motion_key, insert_encoded_tuple,
+};
 use crate::sql::lock::{lock_temp_table, TempTableLease, TempTableLockRef};
 use crate::sql::lua::{lua_decode_ibufs, lua_query_metadata};
 use crate::sql::port::PicoPortOwned;
@@ -37,7 +41,6 @@ use sql::ir::helpers::RepeatableState;
 use sql::ir::options::Options;
 use sql::ir::relation::SpaceEngine;
 use sql::ir::relation::{Column, ColumnRole};
-use sql::ir::transformation::redistribution::{MotionKey, Target};
 use sql::ir::value::{EncodedValue, MsgPackValue, Value};
 use sql::ir::ExplainOptions;
 use sql::utils::MutexLike;
@@ -61,7 +64,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tarantool::error::{Error, TarantoolErrorCode};
+use tarantool::error::Error;
 use tarantool::ffi::sql::Port as TarantoolPort;
 use tarantool::index::{FieldType, IndexOptions, IndexType, Part};
 use tarantool::msgpack::{self, Encode};
@@ -1146,19 +1149,6 @@ fn delete_args<'t>(
     Ok(delete_tuple)
 }
 
-fn ensure_target_space<R: QueryCache>(
-    runtime: &R,
-    table_id: u32,
-    version: u64,
-) -> Result<Space, SbroadError> {
-    if runtime.get_table_version_by_id(table_id)? != version {
-        return Err(SbroadError::OutdatedStorageSchema);
-    }
-
-    // SAFETY: `table_id` already exists. Checked by `get_table_version_by_id`.
-    Ok(unsafe { Space::from_id_unchecked(table_id) })
-}
-
 fn maybe_reshard_vtable<R: Vshard>(
     runtime: &R,
     vtable: &mut VirtualTable,
@@ -1182,83 +1172,6 @@ fn maybe_reshard_vtable<R: Vshard>(
     }
 
     Ok(())
-}
-
-fn apply_insert_with_conflict(
-    insert_result: Result<(), Error>,
-    conflict_strategy: ConflictPolicy,
-    insert_tuple: &impl std::fmt::Debug,
-    replace_on_conflict: impl FnOnce() -> Result<(), SbroadError>,
-) -> Result<bool, SbroadError> {
-    match insert_result {
-        Ok(()) => Ok(true),
-        Err(Error::Tarantool(tnt_err))
-            if tnt_err.error_code() == TarantoolErrorCode::TupleFound as u32 =>
-        {
-            match conflict_strategy {
-                ConflictPolicy::DoNothing => {
-                    tlog!(
-                        Debug,
-                        "failed to insert tuple: {insert_tuple:?}. Skipping according to conflict strategy",
-                    );
-                    Ok(false)
-                }
-                ConflictPolicy::DoReplace => {
-                    tlog!(
-                        Debug,
-                        "failed to insert tuple: {insert_tuple:?}. Trying to replace according to conflict strategy"
-                    );
-                    replace_on_conflict()?;
-                    Ok(true)
-                }
-                ConflictPolicy::DoFail => Err(SbroadError::FailedTo(
-                    Action::Insert,
-                    Some(Entity::Space),
-                    format_smolstr!("{tnt_err}"),
-                )),
-            }
-        }
-        Err(e) => Err(SbroadError::FailedTo(
-            Action::Insert,
-            Some(Entity::Space),
-            format_smolstr!("{e}"),
-        )),
-    }
-}
-
-fn find_insert_motion_key(builder: &TupleBuilderPattern) -> Option<&MotionKey> {
-    builder.iter().find_map(|command| match command {
-        TupleBuilderCommand::CalculateBucketId(motion_key) if !motion_key.targets.is_empty() => {
-            Some(motion_key)
-        }
-        _ => None,
-    })
-}
-
-fn determine_insert_bucket_id<R: Vshard>(
-    runtime: &R,
-    vt_tuple: &VTableTuple,
-    motion_key: &MotionKey,
-) -> Result<u64, SbroadError> {
-    let mut shard_key_tuple = Vec::with_capacity(motion_key.targets.len());
-    for target in &motion_key.targets {
-        match target {
-            Target::Reference(col_idx) => {
-                let value = vt_tuple.get(*col_idx).ok_or_else(|| {
-                    SbroadError::NotFound(
-                        Entity::DistributionKey,
-                        format_smolstr!(
-                            "failed to find a distribution key column {col_idx} in the tuple {vt_tuple:?}."
-                        ),
-                    )
-                })?;
-                shard_key_tuple.push(value);
-            }
-            Target::Value(value) => shard_key_tuple.push(value),
-        }
-    }
-
-    runtime.determine_bucket_id(&shard_key_tuple)
 }
 
 fn build_insert_bucket_index<R: Vshard>(
@@ -1297,26 +1210,26 @@ fn tuple_insert_impl<R: Vshard>(
         .unwrap_or_else(|| vtable.get_bucket_index());
 
     transaction(|| -> Result<(), SbroadError> {
+        let mut insert_one = |insert_tuple| -> Result<(), SbroadError> {
+            let insert_result = space.insert(&insert_tuple).map(|_| ());
+            if apply_insert_with_conflict(insert_result, conflict_strategy, &insert_tuple, || {
+                space.replace(&insert_tuple).map(|_| ()).map_err(|e| {
+                    SbroadError::FailedTo(
+                        Action::ReplaceOnConflict,
+                        Some(Entity::Space),
+                        format_smolstr!("{e}"),
+                    )
+                })
+            })? {
+                result.row_count += 1;
+            }
+            Ok(())
+        };
+
         if bucket_index.is_empty() {
             for vt_tuple in vtable.get_tuples() {
                 let insert_tuple = build_insert_args(vt_tuple, builder, None)?;
-                let insert_result = space.insert(&insert_tuple).map(|_| ());
-                if apply_insert_with_conflict(
-                    insert_result,
-                    conflict_strategy,
-                    &insert_tuple,
-                    || {
-                        space.replace(&insert_tuple).map(|_| ()).map_err(|e| {
-                            SbroadError::FailedTo(
-                                Action::ReplaceOnConflict,
-                                Some(Entity::Space),
-                                format_smolstr!("{e}"),
-                            )
-                        })
-                    },
-                )? {
-                    result.row_count += 1;
-                }
+                insert_one(insert_tuple)?;
             }
             return Ok(());
         }
@@ -1332,23 +1245,7 @@ fn tuple_insert_impl<R: Vshard>(
                     )
                 })?;
                 let insert_tuple = build_insert_args(vt_tuple, builder, Some(bucket_id))?;
-                let insert_result = space.insert(&insert_tuple).map(|_| ());
-                if apply_insert_with_conflict(
-                    insert_result,
-                    conflict_strategy,
-                    &insert_tuple,
-                    || {
-                        space.replace(&insert_tuple).map(|_| ()).map_err(|e| {
-                            SbroadError::FailedTo(
-                                Action::ReplaceOnConflict,
-                                Some(Entity::Space),
-                                format_smolstr!("{e}"),
-                            )
-                        })
-                    },
-                )? {
-                    result.row_count += 1;
-                }
+                insert_one(insert_tuple)?;
             }
         }
 
@@ -1618,21 +1515,8 @@ where
     transaction(|| -> Result<(), SbroadError> {
         for tuple in tuples {
             let tuple_data = tuple?;
-            let insert_tuple = RawBytes::new(tuple_data);
             // TODO: should we care of default and so on
-            let insert_result = space.insert(insert_tuple).map(|_| ());
-            if apply_insert_with_conflict(insert_result, conflict_strategy, &insert_tuple, || {
-                space
-                    .replace(RawBytes::new(tuple_data))
-                    .map(|_| ())
-                    .map_err(|e| {
-                        SbroadError::FailedTo(
-                            Action::ReplaceOnConflict,
-                            Some(Entity::Space),
-                            format_smolstr!("{e}"),
-                        )
-                    })
-            })? {
+            if insert_encoded_tuple(&space, tuple_data, conflict_strategy)? {
                 result.row_count += 1;
             }
         }
