@@ -153,6 +153,10 @@ def send_copy_fail(sock: socket.socket, message: str):
     send_frame(sock, b"f", message.encode("utf-8") + b"\x00")
 
 
+def send_flush(sock: socket.socket):
+    send_frame(sock, b"H")
+
+
 def send_sync(sock: socket.socket):
     send_frame(sock, b"S")
 

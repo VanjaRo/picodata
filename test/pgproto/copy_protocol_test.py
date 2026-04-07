@@ -17,6 +17,7 @@ from test.pgproto.copy_test_utils import (
     send_copy_done,
     send_copy_fail,
     send_execute,
+    send_flush,
     send_parse,
     send_query,
     send_sync,
@@ -196,7 +197,7 @@ def test_copy_messages_outside_copy_mode_fail_cleanly(postgres: Postgres, sender
         sender(sock)
 
         error_fields = _assert_error_and_ready(sock)
-        assert error_fields.get("C") in {"0A000", "08P01"}
+        assert error_fields.get("C") == "08P01"
         assert expected_snippet in error_fields.get("M", "")
 
         send_terminate(sock)
@@ -261,16 +262,29 @@ def test_copy_server_side_error_recovers_connection_without_persisting_rows(post
         assert count_rows(conn, "copy_server_error_state") == 0
 
 
-def test_copy_server_side_error_drops_stale_copydone_during_unwind(postgres: Postgres):
+@pytest.mark.parametrize(
+    "send_stale_message",
+    [
+        pytest.param(send_copy_done, id="copy_done"),
+        pytest.param(lambda sock: send_copy_data_message(sock, b"2\tstale\n"), id="copy_data"),
+        pytest.param(lambda sock: send_copy_fail(sock, "stale client abort"), id="copy_fail"),
+        pytest.param(send_flush, id="flush"),
+        pytest.param(send_sync, id="sync"),
+    ],
+)
+def test_copy_server_side_error_drops_stale_messages_during_unwind(
+    postgres: Postgres,
+    send_stale_message,
+):
     create_test_table_via_instance(postgres, "copy_server_error_unwind")
 
     sock = _startup_copy_session(postgres, "copy_server_error_unwind")
     try:
         send_copy_data_message(sock, b"1\n")
-        send_copy_done(sock)
         error_fields = _assert_error_and_ready(sock)
-        assert error_fields.get("C") == "22P02"
+        assert error_fields.get("C") == "22P04"
 
+        send_stale_message(sock)
         send_query(sock, "SELECT 1")
         messages = recv_until_ready(sock)
         assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
@@ -280,6 +294,93 @@ def test_copy_server_side_error_drops_stale_copydone_during_unwind(postgres: Pos
 
     with connect_admin(postgres) as conn:
         assert count_rows(conn, "copy_server_error_unwind") == 0
+
+
+def test_copy_rejects_oversized_row_in_single_copydata_message(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_oversized_row")
+
+    sock = _startup_copy_session(postgres, "copy_proto_oversized_row")
+    try:
+        oversized_row = b"1\t" + (b"x" * (1024 * 1024)) + b"\n"
+        send_copy_data_message(sock, oversized_row)
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "22P04"
+        assert "COPY row exceeds maximum size" in error_fields.get("M", "")
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        assert count_rows(conn, "copy_proto_oversized_row") == 0
+
+
+def test_copy_rejects_oversized_row_split_across_copydata_messages(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_oversized_row_split")
+
+    sock = _startup_copy_session(postgres, "copy_proto_oversized_row_split")
+    try:
+        send_copy_data_message(sock, b"1\t" + (b"x" * (700 * 1024)))
+        send_copy_data_message(sock, b"x" * (400 * 1024))
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "22P04"
+        assert "COPY row exceeds maximum size" in error_fields.get("M", "")
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        assert count_rows(conn, "copy_proto_oversized_row_split") == 0
+
+
+def test_copy_rejects_mixed_line_endings_with_bad_copy_file_format(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_mixed_line_endings")
+
+    sock = _startup_copy_session(postgres, "copy_proto_mixed_line_endings")
+    try:
+        send_copy_data_message(sock, b"1\talpha\n2\tbeta\r\n")
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "22P04"
+        assert "mixed line endings" in error_fields.get("M", "")
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        assert count_rows(conn, "copy_proto_mixed_line_endings") == 0
+
+
+def test_copy_rejects_trailing_escape_with_bad_copy_file_format(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_trailing_escape")
+
+    sock = _startup_copy_session(postgres, "copy_proto_trailing_escape")
+    try:
+        send_copy_data_message(sock, b"1\tbroken\\")
+        send_copy_done(sock)
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "22P04"
+        assert "ended inside an escape sequence" in error_fields.get("M", "")
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        assert count_rows(conn, "copy_proto_trailing_escape") == 0
 
 
 def test_copy_rejects_stale_schema_before_apply(postgres: Postgres):
