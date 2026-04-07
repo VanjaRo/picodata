@@ -1,4 +1,4 @@
-use crate::pgproto::backend::{result::CopyStart, Backend};
+use crate::pgproto::backend::copy::{CopySession, CopyStart};
 use crate::pgproto::error::{PgError, PgResult};
 use crate::pgproto::messages;
 use crate::pgproto::stream::{FeMessage, PgStream};
@@ -16,6 +16,30 @@ pub enum CopyInMessageOutcome {
     Done { inserted_rows: usize },
     ClientFailed { reason: String },
     Terminate,
+}
+
+pub struct ActiveCopyIn {
+    mode: CopyInMode,
+    session: Option<CopySession>,
+}
+
+impl ActiveCopyIn {
+    pub fn new(mode: CopyInMode, session: CopySession) -> Self {
+        Self {
+            mode,
+            session: Some(session),
+        }
+    }
+
+    pub fn mode(&self) -> CopyInMode {
+        self.mode
+    }
+
+    fn session_mut(&mut self) -> PgResult<&mut CopySession> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| PgError::ProtocolViolation(format_smolstr!("COPY session is missing")))
+    }
 }
 
 pub fn is_copy_in_message(message: &FeMessage) -> bool {
@@ -38,29 +62,29 @@ pub fn send_copy_in_response(
 }
 
 pub fn process_copy_in_message(
-    backend: &Backend,
+    active_copy: &mut ActiveCopyIn,
     message: FeMessage,
 ) -> PgResult<CopyInMessageOutcome> {
     match message {
         FeMessage::CopyData(copy_data) => {
-            backend.on_copy_data(copy_data.data)?;
+            active_copy.session_mut()?.on_copy_data(copy_data.data)?;
             Ok(CopyInMessageOutcome::Continue)
         }
         FeMessage::CopyDone(_) => {
-            let inserted_rows = backend.on_copy_done()?;
+            let inserted_rows = active_copy
+                .session
+                .take()
+                .ok_or_else(|| {
+                    PgError::ProtocolViolation(format_smolstr!("COPY session is missing"))
+                })?
+                .on_copy_done()?;
             Ok(CopyInMessageOutcome::Done { inserted_rows })
         }
-        FeMessage::CopyFail(copy_fail) => {
-            backend.abort_copy();
-            Ok(CopyInMessageOutcome::ClientFailed {
-                reason: copy_fail.message,
-            })
-        }
+        FeMessage::CopyFail(copy_fail) => Ok(CopyInMessageOutcome::ClientFailed {
+            reason: copy_fail.message,
+        }),
         FeMessage::Flush(_) | FeMessage::Sync(_) => Ok(CopyInMessageOutcome::Continue),
-        FeMessage::Terminate(_) => {
-            backend.abort_copy();
-            Ok(CopyInMessageOutcome::Terminate)
-        }
+        FeMessage::Terminate(_) => Ok(CopyInMessageOutcome::Terminate),
         other => Err(PgError::ProtocolViolation(format_smolstr!(
             "unexpected frontend message during COPY FROM STDIN: {other:?}"
         ))),

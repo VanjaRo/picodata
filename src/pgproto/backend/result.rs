@@ -1,3 +1,4 @@
+use super::copy::{CopySession, CopyStart};
 use crate::pgproto::{backend::describe::CommandTag, error::EncodingError, value::PgValue};
 use pgwire::{
     api::results::{DataRowEncoder, FieldInfo},
@@ -7,7 +8,7 @@ use pgwire::{
 use postgres_types::ToSql;
 use std::{sync::Arc, vec::IntoIter};
 
-pub struct Rows {
+pub(crate) struct Rows {
     desc: Arc<Vec<FieldInfo>>,
     encoder: DataRowEncoder,
     rows: IntoIter<Vec<PgValue>>,
@@ -62,7 +63,7 @@ impl Rows {
     }
 }
 
-pub enum ExecuteResult {
+pub(crate) enum ExecuteResult {
     AclOrDdl {
         /// Tag of the command.
         tag: CommandTag,
@@ -92,12 +93,8 @@ pub enum ExecuteResult {
     },
     CopyInStart {
         start: CopyStart,
+        session: CopySession,
     },
     /// Result of an empty query.
     Empty,
-}
-
-#[derive(Debug, Clone)]
-pub struct CopyStart {
-    pub column_count: usize,
 }
