@@ -100,6 +100,7 @@ pub mod copy;
 pub mod direct_insert;
 pub mod dispatch;
 pub mod execute;
+pub mod local_ref;
 pub mod lock;
 pub mod lua;
 pub mod port;

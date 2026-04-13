@@ -40,35 +40,25 @@ impl PreparedDirectInsert {
         }
     }
 
-    pub(crate) fn encode_row<R: Vshard>(
+    pub(crate) fn insert_encoded_slices<'a, R, I>(
         &self,
         runtime: &R,
-        values: &VTableTuple,
-    ) -> Result<Vec<u8>, SbroadError> {
-        let bucket_id = self.bucket_id_for_row(runtime, values)?;
-        self.encode_row_with_bucket(values, bucket_id.as_ref())
-    }
-
-    pub(crate) fn insert_encoded_batch<R: QueryCache>(
-        &self,
-        runtime: &R,
-        tuples: &[Vec<u8>],
-    ) -> Result<usize, SbroadError> {
-        if tuples.is_empty() {
-            return Ok(0);
-        }
-
+        tuples: I,
+    ) -> Result<usize, SbroadError>
+    where
+        R: QueryCache,
+        I: IntoIterator<Item = &'a [u8]>,
+    {
         let space = self.ensure_target_space(runtime)?;
-        let inserted = transaction(|| -> Result<usize, SbroadError> {
+        Ok(transaction(|| -> Result<usize, SbroadError> {
             let mut inserted = 0usize;
-            for tuple in tuples.iter() {
+            for tuple in tuples {
                 if insert_encoded_tuple(&space, tuple, self.conflict_policy)? {
                     inserted = inserted.saturating_add(1);
                 }
             }
             Ok(inserted)
-        })?;
-        Ok(inserted)
+        })?)
     }
 
     pub(crate) fn insert_vtable<R: Vshard + QueryCache>(
@@ -91,7 +81,7 @@ impl PreparedDirectInsert {
         ensure_target_space(runtime, self.table_id, self.schema_version)
     }
 
-    fn bucket_id_for_row<R: Vshard>(
+    pub(crate) fn bucket_id_for_row<R: Vshard>(
         &self,
         runtime: &R,
         values: &VTableTuple,
@@ -102,7 +92,7 @@ impl PreparedDirectInsert {
             .transpose()
     }
 
-    fn encode_row_with_bucket(
+    pub(crate) fn encode_row_with_bucket(
         &self,
         values: &VTableTuple,
         bucket_id: Option<&u64>,
