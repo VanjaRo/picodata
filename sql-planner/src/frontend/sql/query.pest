@@ -3,6 +3,7 @@ Command = _{ SOI ~ (AnonymousBlock | Copy | Query | ExplainQuery | CallProc | DD
 Copy = ${
     ^"copy" ~ W ~ CopyTableName ~ (WO ~ CopyColumns)? ~ W ~ CopyDirection ~ W ~ CopyTarget
     ~ (W ~ CopyWithOptions)? ~ (W ~ CopyLegacyOptions)?
+    ~ (W ~ OnConflict)?
 }
     CopyTableName = @{ (PublicSchema)? ~ Identifier }
     CopyColumns = _{ "(" ~ WO ~ CopyColumnIdentifiers ~ WO ~ ")" }
@@ -11,12 +12,16 @@ Copy = ${
     CopyTarget = { ^"stdin" | ^"stdout" }
     CopyWithOptions = ${ ^"with" ~ WO ~ "(" ~ WO ~ CopyOptionList? ~ WO ~ ")" }
         CopyOptionList = _{ CopyOption ~ (WO ~ "," ~ WO ~ CopyOption)* }
-        CopyOption = _{ CopyFormatOption | CopyDelimiterOption | CopyNullOption | CopyHeaderOption | CopyBatchSizeOption }
+        CopyOption = _{ CopyFormatOption | CopyDelimiterOption | CopyNullOption | CopyHeaderOption | CopySessionFlushRowsOption | CopyDestinationFlushRowsOption | CopySessionFlushBytesOption | CopyDestinationFlushBytesOption | CopyRowBytesOption }
             CopyFormatOption = ${ ^"format" ~ W ~ CopyOptionValue }
             CopyDelimiterOption = ${ ^"delimiter" ~ W ~ SingleQuotedString }
             CopyNullOption = ${ ^"null" ~ W ~ SingleQuotedString }
             CopyHeaderOption = ${ ^"header" ~ (W ~ CopyBoolean)? }
-            CopyBatchSizeOption = ${ ^"batch_size" ~ WO ~ "=" ~ WO ~ Unsigned }
+            CopySessionFlushRowsOption = ${ ^"session_flush_rows" ~ WO ~ "=" ~ WO ~ Unsigned }
+            CopyDestinationFlushRowsOption = ${ ^"destination_flush_rows" ~ WO ~ "=" ~ WO ~ Unsigned }
+            CopySessionFlushBytesOption = ${ ^"session_flush_bytes" ~ WO ~ "=" ~ WO ~ Unsigned }
+            CopyDestinationFlushBytesOption = ${ ^"destination_flush_bytes" ~ WO ~ "=" ~ WO ~ Unsigned }
+            CopyRowBytesOption = ${ ^"row_bytes" ~ WO ~ "=" ~ WO ~ Unsigned }
             CopyOptionValue = _{ SingleQuotedString | Identifier }
             CopyBoolean = { True | False }
     CopyLegacyOptions = _{ CopyLegacyOption ~ (W ~ CopyLegacyOption)* }

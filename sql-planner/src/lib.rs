@@ -9,6 +9,7 @@ use crate::executor::lru::Cache;
 use crate::frontend::sql::command;
 use crate::frontend::Ast;
 use crate::ir::helpers::RepeatableState;
+use crate::ir::operator::ConflictStrategy;
 use crate::ir::options::Options;
 use crate::ir::types::{DerivedType, UnrestrictedType};
 use crate::ir::value::Value;
@@ -65,7 +66,12 @@ pub struct CopyOptions {
     pub delimiter: Option<String>,
     pub null_string: Option<String>,
     pub header: bool,
-    pub batch_size: Option<usize>,
+    pub conflict_strategy: ConflictStrategy,
+    pub session_flush_rows: Option<usize>,
+    pub destination_flush_rows: Option<usize>,
+    pub session_flush_bytes: Option<usize>,
+    pub destination_flush_bytes: Option<usize>,
+    pub row_bytes: Option<usize>,
 }
 
 impl Default for CopyOptions {
@@ -75,7 +81,12 @@ impl Default for CopyOptions {
             delimiter: None,
             null_string: None,
             header: false,
-            batch_size: None,
+            conflict_strategy: ConflictStrategy::DoFail,
+            session_flush_rows: None,
+            destination_flush_rows: None,
+            session_flush_bytes: None,
+            destination_flush_bytes: None,
+            row_bytes: None,
         }
     }
 }
