@@ -1,7 +1,7 @@
 use super::{CopyTargetError, PreparedCopyTarget};
 use crate::cas;
 use crate::schema::{Distribution, TableDef, ADMIN_ID};
-use crate::sql::copy::routing::{build_sharded_copy_routing, tier_replicaset_count, CopyRouting};
+use crate::sql::copy::routing::{build_sharded_copy_routing, CopyWriteMode};
 use crate::sql::direct_insert::PreparedDirectInsert;
 use crate::storage::Catalog;
 use smol_str::{format_smolstr, SmolStr};
@@ -101,11 +101,12 @@ fn build_copy_target(
         builder,
         conflict_policy,
     );
-    let routing = match &table_def.distribution {
-        Distribution::ShardedImplicitly { tier, .. } if tier_replicaset_count(tier)? > 1 => {
-            CopyRouting::Sharded(build_sharded_copy_routing(table_def, tier)?)
+    let write_mode = match &table_def.distribution {
+        Distribution::Global => CopyWriteMode::Global,
+        Distribution::ShardedImplicitly { tier, .. } => {
+            CopyWriteMode::Sharded(build_sharded_copy_routing(table_def, tier)?)
         }
-        _ => CopyRouting::Local,
+        Distribution::ShardedByField { .. } => unreachable!("validated above"),
     };
 
     Ok(PreparedCopyTarget {
@@ -114,7 +115,7 @@ fn build_copy_target(
         field_types,
         conflict_policy,
         insert,
-        routing,
+        write_mode,
     })
 }
 

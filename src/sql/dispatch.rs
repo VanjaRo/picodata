@@ -843,7 +843,7 @@ fn effective_read_preference(ex_plan: &ExecutionPlan) -> SqlResult<String> {
     Ok(read_preference.to_string())
 }
 
-fn should_dispatch_locally(
+pub(crate) fn should_dispatch_locally(
     tier: Option<&str>,
     replicaset_uuid: &str,
     read_preference: &str,

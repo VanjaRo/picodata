@@ -1,4 +1,4 @@
-use super::pending::CopyDestination;
+use super::pending::ShardedCopyDestination;
 use super::target::CopyTargetError;
 use crate::catalog::pico_bucket::BucketState;
 use crate::schema::TableDef;
@@ -6,10 +6,12 @@ use crate::sql::lua::bucket_into_rs;
 use crate::sql::router::DEFAULT_QUERY_TIMEOUT;
 use crate::storage::{Catalog, ToEntryIter};
 use smol_str::SmolStr;
+use std::time::Duration;
+use tarantool::time::Instant;
 
 #[derive(Debug)]
-pub(super) enum CopyRouting {
-    Local,
+pub(super) enum CopyWriteMode {
+    Global,
     Sharded(ShardedCopyRouting),
 }
 
@@ -18,8 +20,7 @@ pub(super) struct ShardedCopyRouting {
     pub(super) tier_name: SmolStr,
     pub(super) schema_version: u64,
     pub(super) prepared_bucket_state_version: u64,
-    pub(super) dispatch_timeout: u64,
-    local_replicaset_uuid: SmolStr,
+    pub(super) dispatch_timeout: Duration,
     bucket_routes: Vec<BucketRoute>,
 }
 
@@ -54,12 +55,24 @@ impl ShardedCopyRouting {
         (bucket_id <= route.bucket_id_end).then_some(route.replicaset_uuid.as_str())
     }
 
-    pub(super) fn destination_for_bucket(&self, bucket_id: u64) -> Option<CopyDestination> {
-        let replicaset_uuid = self.replicaset_uuid_for_bucket(bucket_id)?;
-        if replicaset_uuid == self.local_replicaset_uuid.as_str() {
-            Some(CopyDestination::Local)
+    pub(super) fn destination_for_bucket(
+        &self,
+        bucket_id: u64,
+    ) -> Result<ShardedCopyDestination, CopyTargetError> {
+        let replicaset_uuid = self.replicaset_uuid_for_bucket(bucket_id).ok_or_else(|| {
+            CopyTargetError::MissingBucketRoute {
+                tier_name: self.tier_name.clone(),
+                bucket_id,
+            }
+        })?;
+        if crate::sql::dispatch::should_dispatch_locally(
+            Some(self.tier_name.as_str()),
+            replicaset_uuid,
+            "leader",
+        )? {
+            Ok(ShardedCopyDestination::Local)
         } else {
-            Some(CopyDestination::Replicaset(replicaset_uuid.into()))
+            Ok(ShardedCopyDestination::Replicaset(replicaset_uuid.into()))
         }
     }
 }
@@ -123,29 +136,13 @@ pub(super) fn build_sharded_copy_routing(
 
     bucket_routes.sort_by_key(|route| route.bucket_id_start);
     validate_bucket_routes(tier_name, tier.bucket_count, &bucket_routes)?;
-    let topology = crate::traft::node::global()
-        .map_err(|error| CopyTargetError::internal(error.to_string()))?
-        .topology_cache
-        .get();
-    let local_replicaset_uuid = topology.this_replicaset().uuid.clone();
-
     Ok(ShardedCopyRouting {
         tier_name: tier_name.clone(),
         schema_version: table_def.schema_version,
-        local_replicaset_uuid,
         prepared_bucket_state_version: tier.current_bucket_state_version,
         bucket_routes,
         dispatch_timeout: DEFAULT_QUERY_TIMEOUT,
     })
-}
-
-pub(super) fn tier_replicaset_count(tier_name: &SmolStr) -> Result<usize, CopyTargetError> {
-    let storage = Catalog::try_get(false).expect("storage should be initialized");
-    Ok(storage
-        .replicasets
-        .iter()?
-        .filter(|replicaset| replicaset.tier == *tier_name)
-        .count())
 }
 
 fn build_router_bucket_routes(
@@ -153,12 +150,13 @@ fn build_router_bucket_routes(
     bucket_count: u64,
 ) -> Result<Vec<BucketRoute>, CopyTargetError> {
     let lua = tarantool::lua_state();
+    let deadline = Instant::now_fiber() + DEFAULT_QUERY_TIMEOUT;
     let mut bucket_routes = Vec::new();
     let mut current_uuid: Option<String> = None;
     let mut range_start = 1u64;
 
     for bucket_id in 1..=bucket_count {
-        let replicaset_uuid = bucket_into_rs(&lua, bucket_id, Some(tier_name.as_str()))
+        let replicaset_uuid = bucket_into_rs(&lua, bucket_id, Some(tier_name.as_str()), deadline)
             .map_err(CopyTargetError::from)?;
         match current_uuid.as_deref() {
             Some(current) if current == replicaset_uuid => {}
@@ -230,7 +228,6 @@ mod tests {
         ShardedCopyRouting {
             tier_name: "default".into(),
             schema_version: 1,
-            local_replicaset_uuid: "local-rs".into(),
             prepared_bucket_state_version: 1,
             bucket_routes: vec![
                 BucketRoute {
@@ -254,33 +251,19 @@ mod tests {
     }
 
     #[test]
-    fn destination_for_bucket_maps_to_target_destinations() {
+    fn replicaset_uuid_for_bucket_maps_to_target_replicasets() {
         let routing = routing_for_test();
 
-        assert_eq!(
-            routing
-                .destination_for_bucket(7)
-                .expect("local routing should succeed"),
-            CopyDestination::Local
-        );
-        assert_eq!(
-            routing
-                .destination_for_bucket(150)
-                .expect("remote routing should succeed"),
-            CopyDestination::Replicaset("remote-rs-1".into())
-        );
-        assert_eq!(
-            routing
-                .destination_for_bucket(250)
-                .expect("remote routing should succeed"),
-            CopyDestination::Replicaset("remote-rs-2".into())
-        );
+        assert_eq!(routing.replicaset_uuid_for_bucket(7), Some("local-rs"));
+        assert_eq!(routing.replicaset_uuid_for_bucket(150), Some("remote-rs-1"));
+        assert_eq!(routing.replicaset_uuid_for_bucket(250), Some("remote-rs-2"));
+        assert_eq!(routing.replicaset_uuid_for_bucket(301), None);
     }
 
     #[test]
     fn destination_for_bucket_requires_bucket_id_for_sharded_routing() {
-        let target = crate::sql::copy::target::PreparedCopyTarget::for_test_with_routing(
-            CopyRouting::Sharded(routing_for_test()),
+        let target = crate::sql::copy::target::PreparedCopyTarget::for_test_with_write_mode(
+            CopyWriteMode::Sharded(routing_for_test()),
         );
 
         let error = target

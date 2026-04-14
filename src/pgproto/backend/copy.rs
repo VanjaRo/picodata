@@ -3,22 +3,28 @@ use crate::cas;
 use crate::config::{DEFAULT_SQL_LOG, DYNAMIC_CONFIG};
 use crate::pgproto::error::{PedanticError, PgError, PgErrorCode, PgResult};
 use crate::pgproto::value::{FieldFormat, PgValue};
-use crate::sql::copy::{prepare_copy_target, CopyTargetError, PreparedCopyTarget};
+use crate::sql::copy::{
+    prepare_copy_target, CopyFlushReasonKind, CopyFlushThresholds, CopyFlushThresholdsByScope,
+    CopyTargetError, PendingCopyBatch, PreparedCopyTarget, ShardedCopyDestination,
+};
 use crate::sql::storage::StorageRuntime;
 use bytes::{Bytes, BytesMut};
 use postgres_types::Oid;
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts};
 use smol_str::{format_smolstr, SmolStr};
 use sql::executor::vtable::VTableTuple;
-use sql::ir::types::UnrestrictedType as SbroadType;
 use sql::ir::value::Value as SbroadValue;
 use sql::{CopyFormat, CopyStatement as ParsedCopyStatement};
-use std::{borrow::Cow, sync::LazyLock, time::Instant};
+use sql_protocol::dml::insert::ConflictPolicy;
+use std::{borrow::Cow, collections::HashMap, sync::LazyLock, time::Instant};
 use tarantool::error::{IntoBoxError, TarantoolErrorCode};
 
-const DEFAULT_COPY_BATCH_SIZE: usize = 1024;
-const DEFAULT_COPY_BATCH_BYTES: usize = 1 << 20;
-const DEFAULT_COPY_RECORD_BYTES: usize = DEFAULT_COPY_BATCH_BYTES;
+// Fallback flush targets bound COPY session memory. Query options may override them.
+const COPY_FALLBACK_FLUSH_ROWS: usize = 1024;
+const COPY_FALLBACK_FLUSH_BYTES: usize = 1 << 20;
+
+// Fallback raw text COPY row guard for a row that spans CopyData frames without a line terminator.
+const COPY_FALLBACK_ROW_BYTES: usize = 1 << 20;
 
 pub(crate) static PGPROTO_COPY_SESSIONS_STARTED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::with_opts(Opts::new(
@@ -93,6 +99,12 @@ pub struct CopySpec {
     delimiter: u8,
     null_marker: Vec<u8>,
     header: bool,
+    conflict_policy: ConflictPolicy,
+    session_flush_rows: Option<usize>,
+    destination_flush_rows: Option<usize>,
+    session_flush_bytes: Option<usize>,
+    destination_flush_bytes: Option<usize>,
+    row_bytes: Option<usize>,
 }
 
 impl CopySpec {
@@ -131,6 +143,12 @@ impl CopySpec {
             delimiter,
             null_marker: null_marker.into_bytes(),
             header: copy_from.options.header,
+            conflict_policy: (&copy_from.options.conflict_strategy).into(),
+            session_flush_rows: copy_from.options.session_flush_rows,
+            destination_flush_rows: copy_from.options.destination_flush_rows,
+            session_flush_bytes: copy_from.options.session_flush_bytes,
+            destination_flush_bytes: copy_from.options.destination_flush_bytes,
+            row_bytes: copy_from.options.row_bytes,
         })
     }
 }
@@ -178,51 +196,203 @@ pub(crate) struct CopyStart {
     pub column_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CopyFlushReason {
+    CopyDone,
+    Destination(CopyFlushReasonKind),
+    Session(CopyFlushReasonKind),
+}
+
+impl CopyFlushReason {
+    fn label(self) -> &'static str {
+        match self {
+            CopyFlushReason::CopyDone => "copy_done",
+            CopyFlushReason::Destination(CopyFlushReasonKind::Rows) => "destination_flush_rows",
+            CopyFlushReason::Destination(CopyFlushReasonKind::Bytes) => "destination_flush_bytes",
+            CopyFlushReason::Session(CopyFlushReasonKind::Rows) => "session_flush_rows",
+            CopyFlushReason::Session(CopyFlushReasonKind::Bytes) => "session_flush_bytes",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CopyWriteSession {
+    Global(PendingCopyBatch),
+    Sharded {
+        batches: HashMap<ShardedCopyDestination, PendingCopyBatch>,
+        rows: usize,
+        bytes: usize,
+    },
+}
+
+impl CopyWriteSession {
+    fn new(global: bool) -> Self {
+        if global {
+            Self::Global(PendingCopyBatch::default())
+        } else {
+            Self::Sharded {
+                batches: HashMap::new(),
+                rows: 0,
+                bytes: 0,
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Global(batch) => batch.is_empty(),
+            Self::Sharded { rows, .. } => *rows == 0,
+        }
+    }
+
+    fn destination_would_exceed(
+        &self,
+        destination: Option<&ShardedCopyDestination>,
+        next_row_bytes: usize,
+        limits: CopyFlushThresholds,
+    ) -> Option<CopyFlushReasonKind> {
+        match (self, destination) {
+            (Self::Sharded { batches, .. }, Some(destination)) => batches
+                .get(destination)?
+                .would_exceed(next_row_bytes, limits),
+            _ => None,
+        }
+    }
+
+    fn session_would_exceed(
+        &self,
+        next_row_bytes: usize,
+        limits: CopyFlushThresholds,
+    ) -> Option<CopyFlushReasonKind> {
+        match self {
+            Self::Global(batch) => batch.would_exceed(next_row_bytes, limits),
+            Self::Sharded { rows, bytes, .. } => limits.would_exceed(*rows, *bytes, next_row_bytes),
+        }
+    }
+
+    fn push(&mut self, encoded_row: Vec<u8>, destination: Option<&ShardedCopyDestination>) {
+        match (self, destination) {
+            (Self::Global(batch), None) => batch.push(encoded_row),
+            (
+                Self::Sharded {
+                    batches,
+                    rows,
+                    bytes,
+                },
+                Some(destination),
+            ) => {
+                *rows = rows.saturating_add(1);
+                *bytes = bytes.saturating_add(encoded_row.len());
+                batches
+                    .entry(destination.clone())
+                    .or_default()
+                    .push(encoded_row);
+            }
+            (Self::Global(_), Some(_)) => {
+                unreachable!("global COPY row must not have a sharded destination")
+            }
+            (Self::Sharded { .. }, None) => {
+                unreachable!("sharded COPY row must have a destination")
+            }
+        }
+    }
+
+    fn destination_reached(
+        &self,
+        destination: &ShardedCopyDestination,
+        limits: CopyFlushThresholds,
+    ) -> Option<CopyFlushReasonKind> {
+        match self {
+            Self::Global(_) => None,
+            Self::Sharded { batches, .. } => batches.get(destination)?.reached(limits),
+        }
+    }
+
+    fn session_reached(&self, limits: CopyFlushThresholds) -> Option<CopyFlushReasonKind> {
+        match self {
+            Self::Global(batch) => batch.reached(limits),
+            Self::Sharded { rows, bytes, .. } => limits.reached(*rows, *bytes),
+        }
+    }
+
+    fn sharded_destination(
+        &self,
+        destination: &ShardedCopyDestination,
+    ) -> Option<&PendingCopyBatch> {
+        match self {
+            Self::Global(_) => None,
+            Self::Sharded { batches, .. } => batches.get(destination),
+        }
+    }
+
+    fn remove_sharded_destination(&mut self, destination: &ShardedCopyDestination) {
+        if let Self::Sharded {
+            batches,
+            rows,
+            bytes,
+        } = self
+        {
+            if let Some(batch) = batches.remove(destination) {
+                *rows = rows.saturating_sub(batch.rows());
+                *bytes = bytes.saturating_sub(batch.bytes());
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Global(batch) => *batch = PendingCopyBatch::default(),
+            Self::Sharded {
+                batches,
+                rows,
+                bytes,
+            } => {
+                *rows = 0;
+                *bytes = 0;
+                batches.clear();
+            }
+        }
+    }
+}
+
 pub(crate) struct CopySession {
-    table_name: SmolStr,
     target: PreparedCopyTarget,
     field_oids: Vec<Oid>,
     runtime: StorageRuntime,
     header: bool,
-    batch_size: usize,
-    batch_byte_limit: usize,
-    record_byte_limit: usize,
+    flush_thresholds: CopyFlushThresholdsByScope,
+    row_byte_limit: usize,
     skipped_header: bool,
     record_reader: TextRecordReader,
     row_parser: TextRowParser,
-    batch_tuples: Vec<Vec<u8>>,
-    batch_bytes: usize,
+    write: CopyWriteSession,
     inserted_rows: usize,
 }
 
 impl CopySession {
     fn new(
-        table_name: SmolStr,
         target: PreparedCopyTarget,
         field_oids: Vec<Oid>,
         runtime: StorageRuntime,
         delimiter: u8,
         null_marker: Vec<u8>,
         header: bool,
-        batch_size: usize,
-        batch_byte_limit: usize,
-        record_byte_limit: usize,
+        flush_thresholds: CopyFlushThresholdsByScope,
+        row_byte_limit: usize,
     ) -> Self {
         let row_parser = TextRowParser::new(delimiter, null_marker, field_oids.len());
+        let write = CopyWriteSession::new(target.is_global());
         Self {
-            table_name,
             target,
             field_oids,
             runtime,
             header,
-            batch_size,
-            batch_byte_limit,
-            record_byte_limit,
+            flush_thresholds,
+            row_byte_limit,
             skipped_header: false,
-            record_reader: TextRecordReader::new(),
+            record_reader: TextRecordReader::with_capacity(row_byte_limit.min(8 << 10)),
             row_parser,
-            batch_tuples: Vec::new(),
-            batch_bytes: 0,
+            write,
             inserted_rows: 0,
         }
     }
@@ -246,7 +416,7 @@ impl CopySession {
         if let Some(record) = self.record_reader.finish_record()? {
             self.process_record(&record)?;
         }
-        self.flush_batch("copy_done")?;
+        self.flush_pending_rows(CopyFlushReason::CopyDone)?;
         Ok(self.inserted_rows)
     }
 
@@ -259,23 +429,39 @@ impl CopySession {
         }
 
         let values = self.decode_record(record)?;
-        let tuple = self
+        let (encoded_row, destination) = self
             .target
-            .encode_row(&self.runtime, &values)
-            .map_err(PgError::from)?;
-        if !self.batch_tuples.is_empty()
-            && self.batch_bytes.saturating_add(tuple.len()) > self.batch_byte_limit
+            .prepare_pending_row(&self.runtime, &values)
+            .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error))?;
+        let row_bytes = encoded_row.len();
+
+        if let Some(reason) = self.write.destination_would_exceed(
+            destination.as_ref(),
+            row_bytes,
+            self.flush_thresholds.destination,
+        ) {
+            if let Some(destination) = destination.as_ref() {
+                self.flush_pending_destination(destination, CopyFlushReason::Destination(reason))?;
+            }
+        }
+        if let Some(reason) = self
+            .write
+            .session_would_exceed(row_bytes, self.flush_thresholds.session)
         {
-            self.flush_batch("batch_bytes")?;
+            self.flush_pending_rows(CopyFlushReason::Session(reason))?;
         }
 
-        self.batch_bytes = self.batch_bytes.saturating_add(tuple.len());
-        self.batch_tuples.push(tuple);
-
-        if self.batch_tuples.len() >= self.batch_size {
-            self.flush_batch("batch_size")?;
-        } else if self.batch_bytes >= self.batch_byte_limit {
-            self.flush_batch("batch_bytes")?;
+        self.write.push(encoded_row, destination.as_ref());
+        if let Some(destination) = destination.as_ref() {
+            if let Some(reason) = self
+                .write
+                .destination_reached(destination, self.flush_thresholds.destination)
+            {
+                self.flush_pending_destination(destination, CopyFlushReason::Destination(reason))?;
+            }
+        }
+        if let Some(reason) = self.write.session_reached(self.flush_thresholds.session) {
+            self.flush_pending_rows(CopyFlushReason::Session(reason))?;
         }
 
         Ok(())
@@ -294,26 +480,52 @@ impl CopySession {
             .collect()
     }
 
-    fn flush_batch(&mut self, reason: &'static str) -> PgResult<()> {
-        if self.batch_tuples.is_empty() {
+    fn flush_pending_destination(
+        &mut self,
+        destination: &ShardedCopyDestination,
+        reason: CopyFlushReason,
+    ) -> PgResult<()> {
+        let Some(batch) = self.write.sharded_destination(destination) else {
+            return Ok(());
+        };
+        let started_at = Instant::now();
+        let flush_result = self
+            .target
+            .flush_sharded_batches(&self.runtime, std::iter::once((destination, batch)))
+            .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error));
+        PGPROTO_COPY_BATCH_FLUSH_DURATION.observe(started_at.elapsed().as_secs_f64());
+        let inserted = flush_result?;
+        self.write.remove_sharded_destination(destination);
+        self.finish_flush(inserted, reason);
+        Ok(())
+    }
+
+    fn flush_pending_rows(&mut self, reason: CopyFlushReason) -> PgResult<()> {
+        if self.write.is_empty() {
             return Ok(());
         }
 
         let started_at = Instant::now();
-        let flush_result = self
-            .target
-            .flush_batch(&self.runtime, &self.batch_tuples)
-            .map_err(|error| map_copy_target_flush_error(&self.table_name, error));
+        let flush_result = match &self.write {
+            CopyWriteSession::Global(batch) => self.target.flush_global_batch(batch),
+            CopyWriteSession::Sharded { batches, .. } => self
+                .target
+                .flush_sharded_batches(&self.runtime, batches.iter()),
+        }
+        .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error));
         PGPROTO_COPY_BATCH_FLUSH_DURATION.observe(started_at.elapsed().as_secs_f64());
         let inserted = flush_result?;
+        self.write.clear();
+        self.finish_flush(inserted, reason);
+        Ok(())
+    }
+
+    fn finish_flush(&mut self, inserted: usize, reason: CopyFlushReason) {
         PGPROTO_COPY_BATCHES_FLUSHED_TOTAL
-            .with_label_values(&[reason])
+            .with_label_values(&[reason.label()])
             .inc();
         PGPROTO_COPY_ROWS_INSERTED_TOTAL.inc_by(inserted as u64);
-        self.batch_tuples.clear();
-        self.batch_bytes = 0;
         self.inserted_rows += inserted;
-        Ok(())
     }
 
     fn ensure_pending_record_limit(&self) -> PgResult<()> {
@@ -326,20 +538,20 @@ impl CopySession {
             self.record_reader.pending.as_ref(),
             self.record_reader.scan_escaped,
             incoming,
-            self.record_byte_limit,
+            self.row_byte_limit,
         ) {
             return Ok(());
         }
 
-        Err(record_limit_error(self.record_byte_limit))
+        Err(record_limit_error(self.row_byte_limit))
     }
 
     fn ensure_record_size(&self, record_len: usize) -> PgResult<()> {
-        if record_len <= self.record_byte_limit {
+        if record_len <= self.row_byte_limit {
             return Ok(());
         }
 
-        Err(record_limit_error(self.record_byte_limit))
+        Err(record_limit_error(self.row_byte_limit))
     }
 }
 
@@ -352,8 +564,11 @@ struct TextRecordReader {
 }
 
 impl TextRecordReader {
-    fn new() -> Self {
-        Self::default()
+    fn with_capacity(initial_capacity: usize) -> Self {
+        Self {
+            pending: BytesMut::with_capacity(initial_capacity),
+            ..Self::default()
+        }
     }
 
     fn push(&mut self, bytes: &[u8]) {
@@ -788,18 +1003,44 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn resolve_copy_batch_size(batch_size: Option<usize>) -> PgResult<usize> {
-    let batch_size = batch_size.unwrap_or(DEFAULT_COPY_BATCH_SIZE);
-    if batch_size == 0 {
+fn require_positive_copy_option(name: &str, value: usize) -> PgResult<usize> {
+    if value == 0 {
         return Err(PgError::FeatureNotSupported(format_smolstr!(
-            "COPY batch_size must be greater than zero"
+            "COPY {name} must be greater than zero"
         )));
     }
-    Ok(batch_size)
+    Ok(value)
 }
 
-fn copy_field_oid(field_type: &SbroadType) -> Oid {
-    super::storage::sbroad_type_to_pg(field_type).oid()
+fn resolve_copy_flush_thresholds(spec: &CopySpec) -> PgResult<CopyFlushThresholdsByScope> {
+    let session_rows = require_positive_copy_option(
+        "session_flush_rows",
+        spec.session_flush_rows.unwrap_or(COPY_FALLBACK_FLUSH_ROWS),
+    )?;
+    let destination_rows = require_positive_copy_option(
+        "destination_flush_rows",
+        spec.destination_flush_rows
+            .unwrap_or(COPY_FALLBACK_FLUSH_ROWS),
+    )?;
+
+    Ok(CopyFlushThresholdsByScope::new(
+        CopyFlushThresholds::new(
+            session_rows,
+            Some(require_positive_copy_option(
+                "session_flush_bytes",
+                spec.session_flush_bytes
+                    .unwrap_or(COPY_FALLBACK_FLUSH_BYTES),
+            )?),
+        ),
+        CopyFlushThresholds::new(
+            destination_rows,
+            Some(require_positive_copy_option(
+                "destination_flush_bytes",
+                spec.destination_flush_bytes
+                    .unwrap_or(COPY_FALLBACK_FLUSH_BYTES),
+            )?),
+        ),
+    ))
 }
 
 fn map_copy_target_flush_error(table_name: &SmolStr, error: CopyTargetError) -> PgError {
@@ -846,6 +1087,10 @@ fn map_copy_target_error(error: CopyTargetError) -> PgError {
             PedanticError::new(PgErrorCode::InternalError, message.to_string()).into()
         }
         CopyTargetError::FeatureNotSupported(message) => PgError::FeatureNotSupported(message),
+        CopyTargetError::BucketRoutingStale { .. }
+        | CopyTargetError::BucketRebalancingInProgress { .. } => {
+            PedanticError::new(PgErrorCode::ObjectNotInPrerequisiteState, error.to_string()).into()
+        }
         CopyTargetError::Picodata(crate::traft::error::Error::Cas(
             cas::Error::TableNotOperable { table },
         )) => PedanticError::new(
@@ -855,6 +1100,11 @@ fn map_copy_target_error(error: CopyTargetError) -> PgError {
         .into(),
         CopyTargetError::Picodata(error) => error.into(),
         CopyTargetError::Storage(error) => error.into(),
+        CopyTargetError::MissingBucketId
+        | CopyTargetError::MissingBucketRoute { .. }
+        | CopyTargetError::NoSuchTier { .. } => {
+            PedanticError::new(PgErrorCode::InternalError, error.to_string()).into()
+        }
         CopyTargetError::Tarantool(error)
             if error.error_code() == TarantoolErrorCode::AccessDenied as u32 =>
         {
@@ -865,17 +1115,22 @@ fn map_copy_target_error(error: CopyTargetError) -> PgError {
 }
 
 pub(crate) fn start_copy(spec: CopySpec) -> PgResult<(CopyStart, CopySession)> {
+    let flush_thresholds = resolve_copy_flush_thresholds(&spec)?;
+    let row_byte_limit = require_positive_copy_option(
+        "row_bytes",
+        spec.row_bytes.unwrap_or(COPY_FALLBACK_ROW_BYTES),
+    )?;
     let target = prepare_copy_target(
         spec.schema_name.as_ref(),
         &spec.table_name,
         &spec.columns,
-        ConflictPolicy::DoFail,
+        spec.conflict_policy,
     )
-        .map_err(map_copy_target_error)?;
+    .map_err(map_copy_target_error)?;
     let field_oids = target
         .field_types()
         .iter()
-        .map(copy_field_oid)
+        .map(|field_type| super::storage::sbroad_type_to_pg(field_type).oid())
         .collect::<Vec<_>>();
     let runtime = StorageRuntime::new();
     let start = CopyStart {
@@ -883,18 +1138,60 @@ pub(crate) fn start_copy(spec: CopySpec) -> PgResult<(CopyStart, CopySession)> {
     };
 
     let session = CopySession::new(
-        target.table_name().clone(),
         target,
         field_oids,
         runtime,
         spec.delimiter,
         spec.null_marker,
         spec.header,
-        DEFAULT_COPY_BATCH_SIZE,
-        DEFAULT_COPY_BATCH_BYTES,
-        DEFAULT_COPY_RECORD_BYTES,
+        flush_thresholds,
+        row_byte_limit,
     );
     PGPROTO_COPY_SESSIONS_STARTED_TOTAL.inc();
 
     Ok((start, session))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sharded_bucket_state_change_maps_to_55000() {
+        let error = map_copy_target_error(CopyTargetError::BucketRoutingStale {
+            tier_name: "tier1".into(),
+            prepared_bucket_state_version: 1,
+            live_current_bucket_state_version: 2,
+            live_target_bucket_state_version: 2,
+        });
+
+        assert_eq!(
+            error.info().code,
+            PgErrorCode::ObjectNotInPrerequisiteState.as_str()
+        );
+    }
+
+    #[test]
+    fn sharded_bucket_rebalancing_maps_to_55000() {
+        let error = map_copy_target_error(CopyTargetError::BucketRebalancingInProgress {
+            tier_name: "tier1".into(),
+            current_bucket_state_version: 1,
+            target_bucket_state_version: 2,
+        });
+
+        assert_eq!(
+            error.info().code,
+            PgErrorCode::ObjectNotInPrerequisiteState.as_str()
+        );
+    }
+
+    #[test]
+    fn internal_sharded_route_corruption_maps_to_xx000() {
+        let error = map_copy_target_error(CopyTargetError::MissingBucketRoute {
+            tier_name: "tier1".into(),
+            bucket_id: 42,
+        });
+
+        assert_eq!(error.info().code, PgErrorCode::InternalError.as_str());
+    }
 }

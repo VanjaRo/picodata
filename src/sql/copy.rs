@@ -3,7 +3,7 @@ mod routing;
 mod target;
 
 pub(crate) use pending::{
-    CopyDestination, CopyFlushReasonKind, CopyFlushThresholds, CopyFlushThresholdsByScope,
-    PendingCopyRow, PendingCopyRows,
+    CopyFlushReasonKind, CopyFlushThresholds, CopyFlushThresholdsByScope, PendingCopyBatch,
+    ShardedCopyDestination,
 };
 pub(crate) use target::{prepare_copy_target, CopyTargetError, PreparedCopyTarget};
