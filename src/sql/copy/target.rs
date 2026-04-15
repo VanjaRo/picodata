@@ -73,13 +73,12 @@ impl PreparedCopyTarget {
         runtime: &crate::sql::storage::StorageRuntime,
         destinations: impl IntoIterator<Item = (&'a ShardedCopyDestination, &'a PendingCopyBatch)>,
     ) -> Result<usize, CopyTargetError> {
-        let destinations = destinations
+        let mut destinations = destinations
             .into_iter()
-            .filter(|(_, batch)| !batch.is_empty())
-            .collect::<Vec<_>>();
-        if destinations.is_empty() {
+            .filter(|(_, batch)| !batch.is_empty());
+        let Some(first_destination) = destinations.next() else {
             return Ok(0);
-        }
+        };
         self.ensure_operable()?;
         let CopyWriteMode::Sharded(routing) = &self.write_mode else {
             return Err(CopyTargetError::internal(
@@ -89,8 +88,8 @@ impl PreparedCopyTarget {
         routing.ensure_current()?;
 
         let mut row_count = 0usize;
-        let mut remote_batches = HashMap::new();
-        for (destination, batch) in destinations {
+        let mut remote_batches = None;
+        for (destination, batch) in std::iter::once(first_destination).chain(destinations) {
             match destination {
                 ShardedCopyDestination::Local => {
                     row_count = row_count
@@ -98,12 +97,13 @@ impl PreparedCopyTarget {
                 }
                 ShardedCopyDestination::Replicaset(replicaset_uuid) => {
                     remote_batches
+                        .get_or_insert_with(HashMap::new)
                         .insert(replicaset_uuid.to_string(), batch.encoded_rows.as_slice());
                 }
             }
         }
 
-        if !remote_batches.is_empty() {
+        if let Some(remote_batches) = remote_batches {
             row_count =
                 row_count.saturating_add(self.dispatch_remote_batches(remote_batches, routing)?);
         }
@@ -148,9 +148,9 @@ impl PreparedCopyTarget {
         .map_err(CopyTargetError::from)
     }
 
-    fn dispatch_remote_batches<'a>(
+    fn dispatch_remote_batches(
         &self,
-        remote_batches: HashMap<String, &'a [Vec<u8>]>,
+        remote_batches: HashMap<String, &[Vec<u8>]>,
         routing: &ShardedCopyRouting,
     ) -> Result<usize, CopyTargetError> {
         let remote_row_count = crate::sql::dispatch::dispatch_encoded_insert_batches(

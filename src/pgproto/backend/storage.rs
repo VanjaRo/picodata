@@ -740,7 +740,10 @@ impl PortalInner {
         }
         let (start, session) = copy::start_copy(prepared_copy.spec().clone())?;
 
-        Ok(ExecuteResult::CopyInStart { start, session })
+        Ok(ExecuteResult::CopyInStart {
+            start,
+            session: Box::new(session),
+        })
     }
 
     fn execute(&self, runtime: &RouterRuntime, max_rows: usize) -> PgResult<ExecuteResult> {

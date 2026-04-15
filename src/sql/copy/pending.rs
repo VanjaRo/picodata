@@ -105,6 +105,11 @@ impl PendingCopyBatch {
         self.bytes = self.bytes.saturating_add(row.len());
         self.encoded_rows.push(row);
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes = 0;
+        self.encoded_rows.clear();
+    }
 }
 
 #[cfg(test)]

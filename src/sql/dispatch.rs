@@ -1678,9 +1678,9 @@ fn dml_process<'lua, 'p>(
     port_write_local_dml_response(port, row_count)
 }
 
-pub(crate) fn dispatch_encoded_insert_batches<'a>(
+pub(crate) fn dispatch_encoded_insert_batches(
     core: InsertCoreData,
-    rs_tuples: HashMap<String, &'a [Vec<u8>]>,
+    rs_tuples: HashMap<String, &[Vec<u8>]>,
     tier: Option<&str>,
     timeout: Duration,
 ) -> SqlResult<u64> {

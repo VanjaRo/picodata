@@ -16,7 +16,7 @@ use sql::executor::vtable::VTableTuple;
 use sql::ir::value::Value as SbroadValue;
 use sql::{CopyFormat, CopyStatement as ParsedCopyStatement};
 use sql_protocol::dml::insert::ConflictPolicy;
-use std::{borrow::Cow, collections::HashMap, sync::LazyLock, time::Instant};
+use std::{collections::HashMap, sync::LazyLock, time::Instant};
 use tarantool::error::{IntoBoxError, TarantoolErrorCode};
 
 // Fallback flush targets bound COPY session memory. Query options may override them.
@@ -283,10 +283,13 @@ impl CopyWriteSession {
             ) => {
                 *rows = rows.saturating_add(1);
                 *bytes = bytes.saturating_add(encoded_row.len());
-                batches
-                    .entry(destination.clone())
-                    .or_default()
-                    .push(encoded_row);
+                if let Some(batch) = batches.get_mut(destination) {
+                    batch.push(encoded_row);
+                } else {
+                    let mut batch = PendingCopyBatch::default();
+                    batch.push(encoded_row);
+                    batches.insert(destination.clone(), batch);
+                }
             }
             (Self::Global(_), Some(_)) => {
                 unreachable!("global COPY row must not have a sharded destination")
@@ -325,23 +328,24 @@ impl CopyWriteSession {
         }
     }
 
-    fn remove_sharded_destination(&mut self, destination: &ShardedCopyDestination) {
+    fn clear_sharded_destination(&mut self, destination: &ShardedCopyDestination) {
         if let Self::Sharded {
             batches,
             rows,
             bytes,
         } = self
         {
-            if let Some(batch) = batches.remove(destination) {
+            if let Some(batch) = batches.get_mut(destination) {
                 *rows = rows.saturating_sub(batch.rows());
                 *bytes = bytes.saturating_sub(batch.bytes());
+                batch.clear();
             }
         }
     }
 
     fn clear(&mut self) {
         match self {
-            Self::Global(batch) => *batch = PendingCopyBatch::default(),
+            Self::Global(batch) => batch.clear(),
             Self::Sharded {
                 batches,
                 rows,
@@ -349,7 +353,9 @@ impl CopyWriteSession {
             } => {
                 *rows = 0;
                 *bytes = 0;
-                batches.clear();
+                for batch in batches.values_mut() {
+                    batch.clear();
+                }
             }
         }
     }
@@ -365,6 +371,7 @@ pub(crate) struct CopySession {
     skipped_header: bool,
     record_reader: TextRecordReader,
     row_parser: TextRowParser,
+    decoded_values: VTableTuple,
     write: CopyWriteSession,
     inserted_rows: usize,
 }
@@ -380,6 +387,7 @@ impl CopySession {
         flush_thresholds: CopyFlushThresholdsByScope,
         row_byte_limit: usize,
     ) -> Self {
+        let field_count = field_oids.len();
         let row_parser = TextRowParser::new(delimiter, null_marker, field_oids.len());
         let write = CopyWriteSession::new(target.is_global());
         Self {
@@ -392,6 +400,7 @@ impl CopySession {
             skipped_header: false,
             record_reader: TextRecordReader::with_capacity(row_byte_limit.min(8 << 10)),
             row_parser,
+            decoded_values: Vec::with_capacity(field_count),
             write,
             inserted_rows: 0,
         }
@@ -428,10 +437,10 @@ impl CopySession {
             return Ok(());
         }
 
-        let values = self.decode_record(record)?;
+        self.decode_record(record)?;
         let (encoded_row, destination) = self
             .target
-            .prepare_pending_row(&self.runtime, &values)
+            .prepare_pending_row(&self.runtime, &self.decoded_values)
             .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error))?;
         let row_bytes = encoded_row.len();
 
@@ -467,17 +476,9 @@ impl CopySession {
         Ok(())
     }
 
-    fn decode_record(&self, record: &[u8]) -> PgResult<VTableTuple> {
-        let decoded_fields = self.row_parser.parse_record(record)?;
-        decoded_fields
-            .into_iter()
-            .zip(self.field_oids.iter().copied())
-            .map(|(field, oid)| {
-                let pg_value = PgValue::decode(field.as_deref(), oid, FieldFormat::Text)?;
-                let sbroad_value: SbroadValue = pg_value.try_into()?;
-                Ok(sbroad_value)
-            })
-            .collect()
+    fn decode_record(&mut self, record: &[u8]) -> PgResult<()> {
+        self.row_parser
+            .decode_record_into(record, &self.field_oids, &mut self.decoded_values)
     }
 
     fn flush_pending_destination(
@@ -495,7 +496,7 @@ impl CopySession {
             .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error));
         PGPROTO_COPY_BATCH_FLUSH_DURATION.observe(started_at.elapsed().as_secs_f64());
         let inserted = flush_result?;
-        self.write.remove_sharded_destination(destination);
+        self.write.clear_sharded_destination(destination);
         self.finish_flush(inserted, reason);
         Ok(())
     }
@@ -709,32 +710,22 @@ impl TextRowParser {
         }
     }
 
-    fn parse_record<'a>(&self, record: &'a [u8]) -> PgResult<Vec<Option<Cow<'a, [u8]>>>> {
-        let fields = self.split_fields(record)?;
-        if fields.len() != self.field_count {
-            return Err(PedanticError::new(
-                PgErrorCode::BadCopyFileFormat,
-                format!(
-                    "COPY row has {} columns but expected {}",
-                    fields.len(),
-                    self.field_count
-                ),
-            )
-            .into());
-        }
-
-        Ok(fields)
-    }
-
-    fn split_fields<'a>(&self, record: &'a [u8]) -> PgResult<Vec<Option<Cow<'a, [u8]>>>> {
-        let mut fields = Vec::with_capacity(self.field_count);
+    fn decode_record_into(
+        &self,
+        record: &[u8],
+        field_oids: &[Oid],
+        values: &mut VTableTuple,
+    ) -> PgResult<()> {
+        values.clear();
         let mut field_start = 0usize;
         let mut escaped = false;
         let mut has_escape = false;
+        let mut field_count = 0usize;
 
         for (idx, byte) in record.iter().copied().enumerate() {
             if !escaped && byte == self.delimiter {
-                self.push_field(record, field_start, idx, has_escape, &mut fields)?;
+                self.push_value(record, field_start, idx, has_escape, field_oids, values)?;
+                field_count += 1;
                 field_start = idx + 1;
                 has_escape = false;
                 continue;
@@ -748,26 +739,56 @@ impl TextRowParser {
             }
         }
 
-        self.push_field(record, field_start, record.len(), has_escape, &mut fields)?;
-        Ok(fields)
+        self.push_value(
+            record,
+            field_start,
+            record.len(),
+            has_escape,
+            field_oids,
+            values,
+        )?;
+        field_count += 1;
+        if field_count != self.field_count {
+            values.clear();
+            return Err(PedanticError::new(
+                PgErrorCode::BadCopyFileFormat,
+                format!(
+                    "COPY row has {} columns but expected {}",
+                    field_count, self.field_count
+                ),
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
-    fn push_field<'a>(
+    fn push_value(
         &self,
-        record: &'a [u8],
+        record: &[u8],
         start: usize,
         end: usize,
         has_escape: bool,
-        fields: &mut Vec<Option<Cow<'a, [u8]>>>,
+        field_oids: &[Oid],
+        values: &mut VTableTuple,
     ) -> PgResult<()> {
         let raw = &record[start..end];
-        if raw == self.null_marker.as_slice() {
-            fields.push(None);
+        let Some(oid) = field_oids.get(values.len()).copied() else {
+            if has_escape {
+                self.decode_text_field(raw)?;
+            }
+            return Ok(());
+        };
+        let pg_value = if raw == self.null_marker.as_slice() {
+            PgValue::decode(None, oid, FieldFormat::Text)?
         } else if has_escape {
-            fields.push(Some(Cow::Owned(self.decode_text_field(raw)?)));
+            let decoded = self.decode_text_field(raw)?;
+            PgValue::decode(Some(decoded.as_slice()), oid, FieldFormat::Text)?
         } else {
-            fields.push(Some(Cow::Borrowed(raw)));
-        }
+            PgValue::decode(Some(raw), oid, FieldFormat::Text)?
+        };
+        let sbroad_value: SbroadValue = pg_value.try_into()?;
+        values.push(sbroad_value);
         Ok(())
     }
 
