@@ -126,10 +126,18 @@ impl<S: io::Read + io::Write> PgClient<S> {
 
     fn sync_extended_query(&mut self) -> PgResult<()> {
         loop {
-            if let FeMessage::Sync(_) = self.stream.read_message()? {
-                self.loop_state = MessageLoopState::ReadyForQuery;
-                extended_query::process_sync_message(&self.backend);
-                break Ok(());
+            match self.stream.read_message()? {
+                FeMessage::Sync(_) => {
+                    self.loop_state = MessageLoopState::ReadyForQuery;
+                    extended_query::process_sync_message(&self.backend);
+                    return Ok(());
+                }
+                FeMessage::Terminate(_) => {
+                    tlog!(Info, "terminating the session while waiting for Sync");
+                    self.loop_state = MessageLoopState::Terminated;
+                    return Ok(());
+                }
+                _ => {}
             }
         }
     }

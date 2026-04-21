@@ -88,6 +88,7 @@ pub(super) fn build_sharded_copy_routing(
     table_def: &TableDef,
     tier_name: &SmolStr,
 ) -> Result<ShardedCopyRouting, CopyTargetError> {
+    let dispatch_timeout = DEFAULT_QUERY_TIMEOUT;
     let storage = Catalog::try_get(false).expect("storage should be initialized");
     let tier = storage
         .tiers
@@ -131,7 +132,7 @@ pub(super) fn build_sharded_copy_routing(
     }
 
     if bucket_routes.is_empty() {
-        bucket_routes = build_router_bucket_routes(tier_name, tier.bucket_count)?;
+        bucket_routes = build_router_bucket_routes(tier_name, tier.bucket_count, dispatch_timeout)?;
     }
 
     bucket_routes.sort_by_key(|route| route.bucket_id_start);
@@ -141,16 +142,17 @@ pub(super) fn build_sharded_copy_routing(
         schema_version: table_def.schema_version,
         prepared_bucket_state_version: tier.current_bucket_state_version,
         bucket_routes,
-        dispatch_timeout: DEFAULT_QUERY_TIMEOUT,
+        dispatch_timeout,
     })
 }
 
 fn build_router_bucket_routes(
     tier_name: &SmolStr,
     bucket_count: u64,
+    dispatch_timeout: Duration,
 ) -> Result<Vec<BucketRoute>, CopyTargetError> {
     let lua = tarantool::lua_state();
-    let deadline = Instant::now_fiber() + DEFAULT_QUERY_TIMEOUT;
+    let deadline = Instant::now_fiber().saturating_add(dispatch_timeout);
     let mut bucket_routes = Vec::new();
     let mut current_uuid: Option<String> = None;
     let mut range_start = 1u64;

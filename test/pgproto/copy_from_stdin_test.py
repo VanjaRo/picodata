@@ -1,3 +1,5 @@
+import threading
+
 import psycopg
 import pytest
 
@@ -16,6 +18,9 @@ from pgproto.copy_test_utils import (
     set_admin_password,
 )
 
+TEST_USER = "copy_no_write"
+TEST_PASSWORD = "P@ssw0rd"  # noqa: S105
+
 
 def _local_row_counts(postgres: Postgres, table_name: str, instance_count: int) -> list[int]:
     return [
@@ -25,10 +30,9 @@ def _local_row_counts(postgres: Postgres, table_name: str, instance_count: int) 
 
 
 def _connect_admin_instance(postgres: Postgres, instance):
-    password = "P@ssw0rd"
-    set_admin_password(postgres, password)
+    set_admin_password(postgres, TEST_PASSWORD)
     conn = psycopg.connect(
-        f"user=admin password={password} host={instance.pg_host} port={instance.pg_port} sslmode=disable"
+        f"user=admin password={TEST_PASSWORD} host={instance.pg_host} port={instance.pg_port} sslmode=disable"
     )
     conn.autocommit = True
     return conn
@@ -69,13 +73,21 @@ def _bump_default_tier_bucket_state_version(postgres: Postgres) -> None:
     )
 
 
+def _default_tier_bucket_state(instance) -> tuple[int, int]:
+    current, target = instance.eval(
+        """
+        local tier = box.space._pico_tier:get('default')
+        return {tier.current_bucket_state_version, tier.target_bucket_state_version}
+        """
+    )
+    assert current is not None
+    assert target is not None
+    return current, target
+
+
 def _wait_until_default_tier_bucket_state_version_changes(postgres: Postgres) -> None:
     def bucket_state_changed() -> tuple[int, int]:
-        row = postgres.instance.sql(
-            "SELECT current_bucket_state_version, target_bucket_state_version "
-            "FROM _pico_tier WHERE name = 'default'"
-        )[0]
-        current, target = row
+        current, target = _default_tier_bucket_state(postgres.instance)
         assert current != target
         return current, target
 
@@ -89,18 +101,20 @@ def _wait_until_three_way_bucket_distribution(postgres: Postgres) -> None:
         )
 
 
-def _install_local_lref_probe(postgres: Postgres) -> None:
+def _install_local_lref_probe(postgres: Postgres, *, pause_use_seconds: float = 0.0) -> None:
     postgres.instance.eval(
         """
         local lref = pico.dispatch.lref
-        _G.copy_lref_probe = {
+        local fiber = require('fiber')
+        _G.copy_lref_probe = {{
             add = 0,
             use = 0,
             del = 0,
+            pause_use_seconds = {pause_use_seconds},
             old_add = lref.add,
             old_use = lref.use,
             old_del = lref.del,
-        }
+        }}
 
         lref.add = function(...)
             _G.copy_lref_probe.add = _G.copy_lref_probe.add + 1
@@ -108,6 +122,9 @@ def _install_local_lref_probe(postgres: Postgres) -> None:
         end
         lref.use = function(...)
             _G.copy_lref_probe.use = _G.copy_lref_probe.use + 1
+            if _G.copy_lref_probe.pause_use_seconds > 0 then
+                fiber.sleep(_G.copy_lref_probe.pause_use_seconds)
+            end
             return _G.copy_lref_probe.old_use(...)
         end
         lref.del = function(...)
@@ -115,6 +132,7 @@ def _install_local_lref_probe(postgres: Postgres) -> None:
             return _G.copy_lref_probe.old_del(...)
         end
         """
+        .format(pause_use_seconds=pause_use_seconds)
     )
 
 
@@ -150,12 +168,28 @@ def _copy_rows(
     columns: str | None = '"id", "value"',
     suffix: str = "",
 ) -> str:
+    def write_rows(copy) -> None:
+        for row in rows:
+            copy.write(row)
+
     column_list = "" if columns is None else f" ({columns})"
+    return _run_copy(conn, f'COPY "{table_name}"{column_list} FROM STDIN{suffix}', write_rows)
+
+
+def _run_copy(conn: psycopg.Connection, statement: str, write_rows) -> str:
     with conn.cursor() as cur:
-        with cur.copy(f'COPY "{table_name}"{column_list} FROM STDIN{suffix}') as copy:
-            for row in rows:
-                copy.write(row)
+        with cur.copy(statement) as copy:
+            write_rows(copy)
         return cur.statusmessage
+
+
+def _abort_copy(conn: psycopg.Connection, statement: str, rows) -> None:
+    def write_rows(copy) -> None:
+        for row in rows:
+            copy.write(row)
+        raise RuntimeError("client aborted copy")
+
+    _run_copy(conn, statement, write_rows)
 
 
 def _assert_id_value_rows(
@@ -352,8 +386,13 @@ def test_copy_streaming_default_commits_flushed_prefix_on_late_error(postgres: P
             _copy_rows(conn, "copy_streaming_late_error", [*prefix_rows, "bad\tboom\n"])
 
         persisted = count_rows(conn, "copy_streaming_late_error")
-        assert persisted > 0
-        assert persisted <= len(prefix_rows)
+        assert 0 < persisted <= len(prefix_rows)
+        persisted_rows = conn.execute(
+            'SELECT "id", "value" FROM "copy_streaming_late_error" ORDER BY "id"'
+        ).fetchall()
+        assert persisted_rows == [
+            (idx, f"row-{idx}") for idx in range(1, persisted + 1)
+        ]
         first_row = conn.execute(
             'SELECT "id", "value" FROM "copy_streaming_late_error" WHERE "id" = 1'
         ).fetchone()
@@ -506,10 +545,11 @@ def test_copy_client_fail_aborts_and_connection_recovers(postgres: Postgres):
         create_test_table(conn, "copy_fail_recovery")
 
         with pytest.raises(psycopg.Error, match=r"client aborted copy"):
-            with conn.cursor() as cur:
-                with cur.copy('COPY "copy_fail_recovery" ("id", "value") FROM STDIN') as copy:
-                    copy.write("1\twill_be_aborted\n")
-                    raise RuntimeError("client aborted copy")
+            _abort_copy(
+                conn,
+                'COPY "copy_fail_recovery" ("id", "value") FROM STDIN',
+                ["1\twill_be_aborted\n"],
+            )
 
         assert count_rows(conn, "copy_fail_recovery") == 0
         ping = conn.execute("SELECT 1").fetchone()
@@ -521,16 +561,12 @@ def test_copy_session_flush_rows_preserves_flushed_prefix_on_client_abort(postgr
         create_test_table(conn, "copy_fail_after_flush")
 
         with pytest.raises(psycopg.Error, match=r"client aborted copy"):
-            with conn.cursor() as cur:
-                with cur.copy(
-                    'COPY "copy_fail_after_flush" ("id", "value") '
-                    "FROM STDIN WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)"
-                ) as copy:
-                    copy.write("1\tone\n")
-                    copy.write("2\ttwo\n")
-                    copy.write("3\tthree\n")
-                    copy.write("4\tfour\n")
-                    raise RuntimeError("client aborted copy")
+            _abort_copy(
+                conn,
+                'COPY "copy_fail_after_flush" ("id", "value") '
+                "FROM STDIN WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)",
+                ["1\tone\n", "2\ttwo\n", "3\tthree\n", "4\tfour\n"],
+            )
 
         _assert_id_value_rows(
             conn,
@@ -580,11 +616,12 @@ def test_copy_sharded_all_local_batch_uses_local_fast_path(postgres: Postgres):
     with connect_admin(postgres) as conn:
         create_test_table(conn, "copy_all_local_fast_path")
 
-        local_pks = [
-            find_routed_pk(postgres.instance, is_local=True, start=1),
-            find_routed_pk(postgres.instance, is_local=True, start=64),
-            find_routed_pk(postgres.instance, is_local=True, start=128),
-        ]
+        local_pks = []
+        next_start = 1
+        for _ in range(3):
+            local_pk = find_routed_pk(postgres.instance, is_local=True, start=next_start)
+            local_pks.append(local_pk)
+            next_start = local_pk + 1
 
         _install_local_lref_probe(postgres)
         try:
@@ -617,8 +654,7 @@ def test_copy_sharded_prefix_persists_when_bucket_state_version_changes_during_e
     postgres: Postgres,
 ):
     postgres.cluster.add_instance(wait_online=True, replicaset_name="copy_routing_rs2")
-    initial_instances = postgres.cluster.instances[:2]
-    for instance in initial_instances:
+    for instance in postgres.cluster.instances[:2]:
         postgres.cluster.wait_until_instance_has_this_many_active_buckets(
             instance, 1500, max_retries=20
         )
@@ -629,18 +665,21 @@ def test_copy_sharded_prefix_persists_when_bucket_state_version_changes_during_e
         local_pk = find_routed_pk(postgres.instance, is_local=True)
         remote_pk = find_routed_pk(postgres.instance, is_local=False, start=local_pk + 1)
 
+        def write_rows(copy) -> None:
+            copy.write(f"{local_pk}\tone\n")
+            copy.write(f"{remote_pk}\ttwo\n")
+            _bump_default_tier_bucket_state_version(postgres)
+            _wait_until_default_tier_bucket_state_version_changes(postgres)
+            copy.write(f"{remote_pk + 1}\tthree\n")
+            copy.write(f"{remote_pk + 2}\tfour\n")
+
         with pytest.raises(psycopg.Error, match="bucket routing changed during execution") as exc_info:
-            with conn.cursor() as cur:
-                with cur.copy(
-                    'COPY "copy_bucket_state_changed" ("id", "value") '
-                    "FROM STDIN WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)"
-                ) as copy:
-                    copy.write(f"{local_pk}\tone\n")
-                    copy.write(f"{remote_pk}\ttwo\n")
-                    _bump_default_tier_bucket_state_version(postgres)
-                    _wait_until_default_tier_bucket_state_version_changes(postgres)
-                    copy.write(f"{remote_pk + 1}\tthree\n")
-                    copy.write(f"{remote_pk + 2}\tfour\n")
+            _run_copy(
+                conn,
+                'COPY "copy_bucket_state_changed" ("id", "value") '
+                "FROM STDIN WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)",
+                write_rows,
+            )
 
         assert exc_info.value.sqlstate == "55000"
         rows = conn.execute(
@@ -649,6 +688,65 @@ def test_copy_sharded_prefix_persists_when_bucket_state_version_changes_during_e
         assert rows == [(local_pk, "one"), (remote_pk, "two")]
         assert _local_row_counts(postgres, "copy_bucket_state_changed", 2) == [1, 1]
         assert conn.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_copy_sharded_mixed_batch_rechecks_routing_before_remote_dispatch(
+    postgres: Postgres,
+):
+    postgres.cluster.add_instance(wait_online=True, replicaset_name="copy_routing_rs2")
+    for instance in postgres.cluster.instances[:2]:
+        postgres.cluster.wait_until_instance_has_this_many_active_buckets(
+            instance, 1500, max_retries=20
+        )
+
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_mixed_batch_routing_recheck")
+
+    local_pk = find_routed_pk(postgres.instance, is_local=True)
+    remote_pk = find_routed_pk(postgres.instance, is_local=False, start=local_pk + 1)
+
+    _install_local_lref_probe(postgres, pause_use_seconds=1.0)
+    copy_error = None
+
+    def run_copy() -> None:
+        nonlocal copy_error
+        try:
+            with connect_admin(postgres) as conn:
+                _copy_rows(
+                    conn,
+                    "copy_mixed_batch_routing_recheck",
+                    [f"{local_pk}\tlocal\n", f"{remote_pk}\tremote\n"],
+                    suffix=" WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)",
+                )
+        except psycopg.Error as error:
+            copy_error = error
+
+    def wait_until_local_lref_is_used() -> None:
+        assert _local_lref_probe_counts(postgres)[1] >= 1
+
+    copy_thread = threading.Thread(target=run_copy)
+    copy_thread.start()
+
+    try:
+        Retriable().call(wait_until_local_lref_is_used)
+        _bump_default_tier_bucket_state_version(postgres)
+        _wait_until_default_tier_bucket_state_version_changes(postgres)
+
+        copy_thread.join(timeout=10)
+        assert not copy_thread.is_alive()
+        assert copy_error is not None
+        assert "bucket routing changed during execution" in str(copy_error)
+        assert copy_error.sqlstate == "55000"
+
+        with connect_admin(postgres) as conn:
+            _assert_id_value_rows(
+                conn,
+                "copy_mixed_batch_routing_recheck",
+                [(local_pk, "local")],
+            )
+            assert conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        _restore_local_lref_probe(postgres)
 
 
 def test_copy_sharded_mixed_local_and_remote_batch_persists_local_prefix_on_remote_conflict(
@@ -936,16 +1034,13 @@ def test_copy_rejects_missing_required_global_bucket_id_column(postgres: Postgre
 
 
 def test_copy_requires_write_privilege(postgres: Postgres):
-    user = "copy_no_write"
-    password = "P@ssw0rd"
-
     with connect_admin(postgres) as conn:
         create_test_table(conn, "copy_acl_denied")
 
-    postgres.instance.sql(f'CREATE USER "{user}" WITH PASSWORD \'{password}\' USING md5')
+    postgres.instance.sql(f'CREATE USER "{TEST_USER}" WITH PASSWORD \'{TEST_PASSWORD}\' USING md5')
 
     with psycopg.connect(
-        f"user={user} password={password} host={postgres.host} port={postgres.port} sslmode=disable"
+        f"user={TEST_USER} password={TEST_PASSWORD} host={postgres.host} port={postgres.port} sslmode=disable"
     ) as conn:
         conn.autocommit = True
 
@@ -970,8 +1065,7 @@ def test_copy_rejects_unsupported_copy_format(postgres: Postgres):
 
 
 def test_copy_rejects_non_operable_table_at_start(postgres: Postgres):
-    password = "P@ssw0rd"
-    set_admin_password(postgres, password)
+    set_admin_password(postgres, TEST_PASSWORD)
 
     error_injection = "BLOCK_GOVERNOR_BEFORE_DDL_COMMIT"
     postgres.instance.call("pico._inject_error", error_injection, True)
@@ -990,7 +1084,7 @@ def test_copy_rejects_non_operable_table_at_start(postgres: Postgres):
             )
 
         with psycopg.connect(
-            f"user=admin password={password} host={postgres.host} port={postgres.port} sslmode=disable"
+            f"user=admin password={TEST_PASSWORD} host={postgres.host} port={postgres.port} sslmode=disable"
         ) as conn:
             conn.autocommit = True
 

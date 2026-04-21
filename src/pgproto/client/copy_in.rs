@@ -57,7 +57,7 @@ pub fn send_copy_in_response(
     stream: &mut PgStream<impl Read + Write>,
     start: &CopyStart,
 ) -> PgResult<()> {
-    stream.write_message(messages::copy_in_response_text(start.column_count))?;
+    stream.write_message(messages::copy_in_response_text(start.column_count)?)?;
     Ok(())
 }
 

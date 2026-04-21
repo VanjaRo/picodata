@@ -166,8 +166,10 @@ def test_copy_extended_query_success_sequence(postgres: Postgres):
 
 def test_copy_extended_query_sharded_remote_conflict_recovers_pipeline(postgres: Postgres):
     create_test_table_via_instance(postgres, "copy_proto_extended_conflict")
-    postgres.cluster.add_instance(wait_online=True, replicaset_name="copy_proto_conflict_rs2")
-    for instance in postgres.cluster.instances[:2]:
+    remote_instance = postgres.cluster.add_instance(
+        wait_online=True, replicaset_name="copy_proto_conflict_rs2"
+    )
+    for instance in (postgres.instance, remote_instance):
         postgres.cluster.wait_until_instance_has_this_many_active_buckets(
             instance, 1500, max_retries=20
         )

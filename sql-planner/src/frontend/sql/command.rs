@@ -2,7 +2,7 @@ use super::ast::{ParseTree, Rule};
 use super::conflict_strategy_from_rule;
 use crate::errors::{Entity, SbroadError};
 use crate::executor::engine::helpers::normalize_name_from_sql;
-use crate::{CopyFormat, CopyFrom, CopyOptions, CopyStatement, CopyTableTarget, CopyTo};
+use crate::{CopyFormat, CopyFrom, CopyOptions, CopyStatement, CopyTableTarget};
 use pest::iterators::Pair;
 use pest::Parser;
 use smol_str::{format_smolstr, SmolStr};
@@ -35,45 +35,13 @@ fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
 
     let mut target = None;
     let mut columns = Vec::new();
-    let mut direction = None;
-    let mut endpoint = None;
     let mut options = CopyOptions::default();
 
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::CopyTableName => target = Some(parse_table_name(child.as_str())?),
             Rule::Identifier => columns.push(normalize_name_from_sql(child.as_str())),
-            Rule::CopyDirection => {
-                direction = Some(match child.as_str().to_ascii_lowercase().as_str() {
-                    "from" => ParsedDirection::From,
-                    "to" => ParsedDirection::To,
-                    unexpected => {
-                        return Err(SbroadError::ParsingError(
-                            Entity::Query,
-                            format_smolstr!("unsupported COPY direction: {unexpected}"),
-                        ));
-                    }
-                });
-            }
-            Rule::CopyTarget => {
-                endpoint = Some(match child.as_str().to_ascii_lowercase().as_str() {
-                    "stdin" => ParsedEndpoint::Stdin,
-                    "stdout" => ParsedEndpoint::Stdout,
-                    unexpected => {
-                        return Err(SbroadError::ParsingError(
-                            Entity::Query,
-                            format_smolstr!("unsupported COPY target: {unexpected}"),
-                        ));
-                    }
-                });
-            }
-            Rule::CopyWithOptions => parse_with_options(&mut options, child)?,
-            Rule::CopyLegacyDelimiter => options.delimiter = Some(parse_option_value(child)),
-            Rule::CopyLegacyNull => options.null_string = Some(parse_option_value(child)),
-            Rule::DoNothing | Rule::DoReplace | Rule::DoFail => {
-                options.conflict_strategy = conflict_strategy_from_rule(child.as_rule())
-                    .expect("COPY conflict strategy rule should be supported");
-            }
+            Rule::CopyFromDirection => parse_copy_from_direction(child, &mut options)?,
             _ => {}
         }
     }
@@ -87,28 +55,43 @@ fn parse_copy(pair: Pair<'_, Rule>) -> Result<CopyStatement, SbroadError> {
         columns,
     };
 
-    let direction = direction.ok_or_else(|| {
-        SbroadError::Invalid(Entity::Query, Some("COPY direction is missing".into()))
-    })?;
-    let endpoint = endpoint.ok_or_else(|| {
-        SbroadError::Invalid(Entity::Query, Some("COPY target is missing".into()))
-    })?;
+    Ok(CopyStatement::From(CopyFrom { table, options }))
+}
 
-    match (direction, endpoint) {
-        (ParsedDirection::From, ParsedEndpoint::Stdin) => {
-            Ok(CopyStatement::From(CopyFrom { table, options }))
+fn parse_copy_from_direction(
+    pair: Pair<'_, Rule>,
+    options: &mut CopyOptions,
+) -> Result<(), SbroadError> {
+    debug_assert_eq!(pair.as_rule(), Rule::CopyFromDirection);
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::CopyTarget => parse_copy_target(child.as_str())?,
+            Rule::CopyWithOptions => parse_with_options(options, child)?,
+            Rule::DoNothing | Rule::DoReplace | Rule::DoFail => {
+                options.conflict_strategy = conflict_strategy_from_rule(child.as_rule())
+                    .expect("COPY conflict strategy rule should be supported");
+            }
+            unexpected => {
+                return Err(SbroadError::ParsingError(
+                    Entity::Query,
+                    format_smolstr!("unsupported COPY FROM child: {unexpected:?}"),
+                ));
+            }
         }
-        (ParsedDirection::To, ParsedEndpoint::Stdout) => {
-            Ok(CopyStatement::To(CopyTo { table, options }))
-        }
-        (ParsedDirection::From, ParsedEndpoint::Stdout) => Err(SbroadError::Invalid(
+    }
+
+    Ok(())
+}
+
+fn parse_copy_target(raw: &str) -> Result<(), SbroadError> {
+    if raw.eq_ignore_ascii_case("stdin") {
+        Ok(())
+    } else {
+        Err(SbroadError::ParsingError(
             Entity::Query,
-            Some("COPY FROM STDOUT is invalid".into()),
-        )),
-        (ParsedDirection::To, ParsedEndpoint::Stdin) => Err(SbroadError::Invalid(
-            Entity::Query,
-            Some("COPY TO STDIN is invalid".into()),
-        )),
+            format_smolstr!("unsupported COPY target: {raw}"),
+        ))
     }
 }
 
@@ -236,18 +219,6 @@ fn split_top_level_dot(name: &str) -> Option<usize> {
     None
 }
 
-#[derive(Clone, Copy)]
-enum ParsedDirection {
-    From,
-    To,
-}
-
-#[derive(Clone, Copy)]
-enum ParsedEndpoint {
-    Stdin,
-    Stdout,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{parse_command, ParsedCommand};
@@ -360,6 +331,17 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn rejects_copy_to_stdout() {
+        assert!(parse_command(r#"COPY "t" TO STDOUT"#).is_err());
+    }
+
+    #[test]
+    fn rejects_copy_legacy_option_syntax() {
+        assert!(parse_command(r#"COPY "t" FROM STDIN DELIMITER AS '|'"#).is_err());
+        assert!(parse_command(r#"COPY "t" FROM STDIN NULL AS 'nil'"#).is_err());
     }
 
     #[test]

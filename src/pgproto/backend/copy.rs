@@ -113,9 +113,7 @@ impl CopySpec {
             PgError::FeatureNotSupported(format_smolstr!("{reason}"))
         }
 
-        let sql::CopyStatement::From(copy_from) = statement else {
-            return Err(unsupported_copy("COPY TO is not supported"));
-        };
+        let sql::CopyStatement::From(copy_from) = statement;
 
         // TODO: extend COPY decoding beyond text once the MVP protocol and execution
         // contract is settled. CSV and binary should plug into the same resolved spec
@@ -962,7 +960,6 @@ fn incoming_exceeds_record_limit(
     if pending.len().saturating_add(incoming.len()) <= record_byte_limit {
         return false;
     }
-
     let mut record_len = pending.len();
     let mut escaped = pending_escaped;
     let mut awaiting_lf_after_cr = false;
@@ -1136,11 +1133,6 @@ fn map_copy_target_error(error: CopyTargetError) -> PgError {
 }
 
 pub(crate) fn start_copy(spec: CopySpec) -> PgResult<(CopyStart, CopySession)> {
-    let flush_thresholds = resolve_copy_flush_thresholds(&spec)?;
-    let row_byte_limit = require_positive_copy_option(
-        "row_bytes",
-        spec.row_bytes.unwrap_or(COPY_FALLBACK_ROW_BYTES),
-    )?;
     let target = prepare_copy_target(
         spec.schema_name.as_ref(),
         &spec.table_name,
@@ -1153,11 +1145,15 @@ pub(crate) fn start_copy(spec: CopySpec) -> PgResult<(CopyStart, CopySession)> {
         .iter()
         .map(|field_type| super::storage::sbroad_type_to_pg(field_type).oid())
         .collect::<Vec<_>>();
+    let flush_thresholds = resolve_copy_flush_thresholds(&spec)?;
+    let row_byte_limit = require_positive_copy_option(
+        "row_bytes",
+        spec.row_bytes.unwrap_or(COPY_FALLBACK_ROW_BYTES),
+    )?;
     let runtime = StorageRuntime::new();
     let start = CopyStart {
         column_count: field_oids.len(),
     };
-
     let session = CopySession::new(
         target,
         field_oids,
@@ -1214,5 +1210,20 @@ mod tests {
         });
 
         assert_eq!(error.info().code, PgErrorCode::InternalError.as_str());
+    }
+
+    #[test]
+    fn escaped_cr_before_lf_keeps_lf_as_record_terminator() {
+        let mut reader = TextRecordReader::with_capacity(8);
+
+        reader.push(br"one\");
+        assert!(reader.next_record().unwrap().is_none());
+
+        reader.push(b"\r\ntwo\n");
+        let record = reader.next_record().unwrap().unwrap();
+        let next = reader.next_record().unwrap().unwrap();
+
+        assert_eq!(record.as_ref(), b"one\\\r");
+        assert_eq!(next.as_ref(), b"two");
     }
 }

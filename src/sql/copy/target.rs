@@ -104,6 +104,7 @@ impl PreparedCopyTarget {
         }
 
         if let Some(remote_batches) = remote_batches {
+            routing.ensure_current()?;
             row_count =
                 row_count.saturating_add(self.dispatch_remote_batches(remote_batches, routing)?);
         }
@@ -121,7 +122,6 @@ impl PreparedCopyTarget {
             )),
             CopyWriteMode::Sharded(routing) => {
                 let bucket_id = bucket_id.ok_or(CopyTargetError::MissingBucketId)?;
-                routing.ensure_current()?;
                 routing.destination_for_bucket(bucket_id)
             }
         }

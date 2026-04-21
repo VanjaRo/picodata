@@ -683,7 +683,7 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::Tcl { tag })
             }
-            QueryType::Dml => unreachable!("DML portals use execute_bound_dml"),
+            QueryType::Dml => unreachable!("DML portals use execute_bound_dml"), // Dead code: DML takes the early return above and is routed to execute_bound_dml before this match.
             QueryType::Dql => {
                 let rows = port_read_tuples(
                     port.iter().skip(1),
@@ -724,6 +724,9 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::AclOrDdl { tag })
             }
+            // COPY statements are bound into `PortalSource::Copy`, so `Portal::new` places them
+            // into `PortalState::CopyReady` and `PortalInner::execute` starts the COPY handshake
+            // from that branch before `start_sql` can reach this SQL dispatch match.
             QueryType::Copy => unreachable!("COPY portals are started from CopyReady"),
             QueryType::Empty => PortalState::ResultReady(ExecuteResult::Empty),
         };

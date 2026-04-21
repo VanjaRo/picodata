@@ -1,15 +1,17 @@
 Command = _{ SOI ~ (AnonymousBlock | Copy | Query | ExplainQuery | CallProc | DDL | ACL | TCL | Plugin | Deallocate | EmptyQuery) ~ EOF }
 
 Copy = ${
-    ^"copy" ~ W ~ CopyTableName ~ (WO ~ CopyColumns)? ~ W ~ CopyDirection ~ W ~ CopyTarget
-    ~ (W ~ CopyWithOptions)? ~ (W ~ CopyLegacyOptions)?
-    ~ (W ~ OnConflict)?
+    ^"copy" ~ W ~ CopyTableName ~ (WO ~ CopyColumns)? ~ W ~ CopyFromDirection
 }
     CopyTableName = @{ (PublicSchema)? ~ Identifier }
     CopyColumns = _{ "(" ~ WO ~ CopyColumnIdentifiers ~ WO ~ ")" }
         CopyColumnIdentifiers = _{ Identifier ~ (WO ~ "," ~ WO ~ Identifier)* }
-    CopyDirection = { ^"from" | ^"to" }
-    CopyTarget = { ^"stdin" | ^"stdout" }
+    CopyFromDirection = {
+        ^"from" ~ W ~ CopyTarget
+        ~ (W ~ CopyWithOptions)?
+        ~ (W ~ OnConflict)?
+    }
+    CopyTarget = { ^"stdin" }
     CopyWithOptions = ${ ^"with" ~ WO ~ "(" ~ WO ~ CopyOptionList? ~ WO ~ ")" }
         CopyOptionList = _{ CopyOption ~ (WO ~ "," ~ WO ~ CopyOption)* }
         CopyOption = _{ CopyFormatOption | CopyDelimiterOption | CopyNullOption | CopyHeaderOption | CopySessionFlushRowsOption | CopyDestinationFlushRowsOption | CopySessionFlushBytesOption | CopyDestinationFlushBytesOption | CopyRowBytesOption }
@@ -24,10 +26,6 @@ Copy = ${
             CopyRowBytesOption = ${ ^"row_bytes" ~ WO ~ "=" ~ WO ~ Unsigned }
             CopyOptionValue = _{ SingleQuotedString | Identifier }
             CopyBoolean = { True | False }
-    CopyLegacyOptions = _{ CopyLegacyOption ~ (W ~ CopyLegacyOption)* }
-        CopyLegacyOption = _{ CopyLegacyDelimiter | CopyLegacyNull }
-            CopyLegacyDelimiter = ${ ^"delimiter" ~ W ~ ^"as" ~ W ~ SingleQuotedString }
-            CopyLegacyNull = ${ ^"null" ~ W ~ ^"as" ~ W ~ SingleQuotedString }
 
 AnonymousBlock = ${
     ^"do" ~ W ~ ExplicitBlockLanguage? ~

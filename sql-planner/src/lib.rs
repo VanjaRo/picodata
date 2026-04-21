@@ -32,7 +32,6 @@ pub mod utils;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyStatement {
     From(CopyFrom),
-    To(CopyTo),
 }
 
 #[derive(Debug)]
@@ -43,12 +42,6 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFrom {
-    pub table: CopyTableTarget,
-    pub options: CopyOptions,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyTo {
     pub table: CopyTableTarget,
     pub options: CopyOptions,
 }
