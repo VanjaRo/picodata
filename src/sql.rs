@@ -96,6 +96,7 @@ use std::str::from_utf8_unchecked;
 use std::time::Duration;
 
 pub mod concurrency;
+pub mod direct_insert;
 pub mod dispatch;
 pub mod execute;
 pub mod lock;

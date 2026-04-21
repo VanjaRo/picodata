@@ -3,18 +3,32 @@ use super::Backend;
 use crate::catalog::pico_bucket::DEFAULT_BUCKET_ID_COLUMN_NAME;
 use crate::pgproto::client::ClientId;
 use crate::pgproto::error::{PedanticError, PgError, PgErrorCode, PgResult};
+use crate::pgproto::value::{FieldFormat, PgValue};
 use crate::schema::{Distribution, TableDef, ADMIN_ID};
+use crate::sql::direct_insert::DirectInsertTarget;
+use crate::sql::storage::StorageRuntime;
 use crate::storage::{Catalog, ToEntryIter};
 use bytes::Bytes;
+use postgres_types::Oid;
 use smol_str::{format_smolstr, SmolStr};
+use sql::executor::engine::helpers::TupleBuilderCommand;
+use sql::executor::vtable::VTableTuple;
+use sql::ir::relation::Column;
+use sql::ir::transformation::redistribution::{MotionKey, Target};
+use sql::ir::types::UnrestrictedType as SbroadType;
+use sql::ir::value::Value as SbroadValue;
 use sql::{CopyFormat, CopyStatement as ParsedCopyStatement};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tarantool::session::with_su;
+use tarantool::space::Field;
 
 thread_local! {
-    static COPY_SESSIONS: RefCell<BTreeMap<ClientId, CopySession>> = RefCell::new(BTreeMap::new());
+    static COPY_SESSIONS: RefCell<BTreeMap<ClientId, CopySession>> = const { RefCell::new(BTreeMap::new()) };
 }
+
+const DEFAULT_COPY_BATCH_SIZE: usize = 1024;
+const DEFAULT_COPY_BATCH_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct CopySpec {
@@ -66,70 +80,49 @@ impl CopySpec {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedCopySpec {
-    table_name: SmolStr,
-    table_sql: String,
-    columns_sql: Vec<String>,
-    field_count: usize,
-    delimiter: u8,
-    null_marker: Vec<u8>,
-    header: bool,
-    schema_version: u64,
-}
-
-impl ResolvedCopySpec {
-    fn build_insert_sql(&self, row_count: usize) -> String {
-        let mut values = String::new();
-        let mut parameter_idx = 1usize;
-
-        for row_idx in 0..row_count {
-            if row_idx > 0 {
-                values.push_str(", ");
-            }
-            values.push('(');
-            for field_idx in 0..self.field_count {
-                if field_idx > 0 {
-                    values.push_str(", ");
-                }
-                values.push('$');
-                values.push_str(&parameter_idx.to_string());
-                parameter_idx += 1;
-            }
-            values.push(')');
-        }
-
-        let columns = if self.columns_sql.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", self.columns_sql.join(", "))
-        };
-
-        format!(
-            "INSERT INTO {}{} VALUES {}",
-            self.table_sql, columns, values
-        )
-    }
-}
-
 struct CopySession {
-    spec: ResolvedCopySpec,
+    table_name: SmolStr,
+    target: DirectInsertTarget,
+    field_oids: Vec<Oid>,
+    runtime: StorageRuntime,
+    header: bool,
+    batch_size: usize,
+    batch_byte_limit: usize,
     skipped_header: bool,
     record_reader: TextRecordReader,
     row_parser: TextRowParser,
-    row_buffer: Vec<Vec<Option<Bytes>>>,
+    batch_tuples: Vec<Vec<u8>>,
+    batch_bytes: usize,
+    inserted_rows: usize,
 }
 
 impl CopySession {
-    fn new(spec: ResolvedCopySpec) -> Self {
-        let row_parser =
-            TextRowParser::new(spec.delimiter, spec.null_marker.clone(), spec.field_count);
+    fn new(
+        table_name: SmolStr,
+        target: DirectInsertTarget,
+        field_oids: Vec<Oid>,
+        runtime: StorageRuntime,
+        delimiter: u8,
+        null_marker: Vec<u8>,
+        header: bool,
+        batch_size: usize,
+        batch_byte_limit: usize,
+    ) -> Self {
+        let row_parser = TextRowParser::new(delimiter, null_marker, field_oids.len());
         Self {
-            spec,
+            table_name,
+            target,
+            field_oids,
+            runtime,
+            header,
+            batch_size,
+            batch_byte_limit,
             skipped_header: false,
             record_reader: TextRecordReader::new(),
             row_parser,
-            row_buffer: Vec::new(),
+            batch_tuples: Vec::new(),
+            batch_bytes: 0,
+            inserted_rows: 0,
         }
     }
 
@@ -143,52 +136,57 @@ impl CopySession {
         Ok(())
     }
 
-    fn on_copy_done(mut self, backend: &Backend) -> PgResult<usize> {
+    fn on_copy_done(mut self) -> PgResult<usize> {
         if let Some(record) = self.record_reader.finish_record()? {
             self.process_record(&record)?;
         }
-        self.ensure_schema_unchanged()?;
-        self.apply_rows(backend)
+        self.flush_batch()?;
+        Ok(self.inserted_rows)
     }
 
     fn process_record(&mut self, record: &[u8]) -> PgResult<()> {
-        if self.spec.header && !self.skipped_header {
+        if self.header && !self.skipped_header {
             self.skipped_header = true;
             return Ok(());
         }
 
-        self.row_buffer.push(self.row_parser.parse_record(record)?);
+        let values = self.decode_record(record)?;
+        let tuple = self
+            .target
+            .encode_row(&self.runtime, &values)
+            .map_err(PgError::from)?;
+        self.batch_bytes = self.batch_bytes.saturating_add(tuple.len());
+        self.batch_tuples.push(tuple);
+
+        if self.batch_tuples.len() >= self.batch_size || self.batch_bytes >= self.batch_byte_limit {
+            self.flush_batch()?;
+        }
+
         Ok(())
     }
 
-    fn ensure_schema_unchanged(&self) -> PgResult<()> {
-        let current = load_table_schema_version(&self.spec.table_name)?;
-        if current != self.spec.schema_version {
-            return Err(PgError::other(format!(
-                "COPY target table schema changed during execution: {}",
-                self.spec.table_name
-            )));
-        }
-        Ok(())
+    fn decode_record(&self, record: &[u8]) -> PgResult<VTableTuple> {
+        let decoded_fields = self.row_parser.parse_record(record)?;
+        decoded_fields
+            .into_iter()
+            .zip(self.field_oids.iter().copied())
+            .map(|(field, oid)| {
+                let pg_value = PgValue::decode(field.as_deref(), oid, FieldFormat::Text)?;
+                let sbroad_value: SbroadValue = pg_value.try_into()?;
+                Ok(sbroad_value)
+            })
+            .collect()
     }
 
-    fn apply_rows(&self, backend: &Backend) -> PgResult<usize> {
-        if self.row_buffer.is_empty() {
-            return Ok(0);
-        }
-
-        // TODO: replace the buffered single-statement INSERT synthesis with a dedicated
-        // COPY apply path once COPY grows beyond the current strict single-node MVP.
-        let sql = self.spec.build_insert_sql(self.row_buffer.len());
-
-        let mut params = Vec::with_capacity(self.row_buffer.len() * self.spec.field_count);
-        for row in &self.row_buffer {
-            params.extend(row.iter().cloned());
-        }
-
-        let bound = backend.bind_sql_statement(&sql, params)?;
-        let router = crate::sql::router::RouterRuntime::new();
-        super::storage::execute_bound_dml(&router, bound)
+    fn flush_batch(&mut self) -> PgResult<()> {
+        let inserted = self
+            .target
+            .flush_batch(&self.runtime, &self.batch_tuples)
+            .map_err(|error| map_copy_flush_error(&self.table_name, error))?;
+        self.batch_tuples.clear();
+        self.batch_bytes = 0;
+        self.inserted_rows += inserted;
+        Ok(())
     }
 }
 
@@ -549,68 +547,177 @@ fn ensure_supported_schema(schema_name: Option<&SmolStr>) -> PgResult<()> {
     Ok(())
 }
 
-fn sql_quote_identifier(name: &str) -> String {
-    let escaped = name.replace('"', "\"\"");
-    format!("\"{escaped}\"")
-}
-
-fn default_copy_columns(table_def: &TableDef) -> Vec<String> {
-    let skip_implicit_bucket_id = matches!(
-        table_def.distribution,
-        Distribution::ShardedImplicitly { .. }
-    );
-
-    table_def
-        .format
-        .iter()
-        .filter(|field| {
-            !(skip_implicit_bucket_id && field.name.as_str() == DEFAULT_BUCKET_ID_COLUMN_NAME)
-        })
-        .map(|field| sql_quote_identifier(&field.name))
-        .collect()
-}
-
-fn resolve_copy_spec(spec: CopySpec) -> PgResult<ResolvedCopySpec> {
-    let storage = Catalog::try_get(false).expect("storage should be initialized");
-    ensure_supported_schema(spec.schema_name.as_ref())?;
-    let table_name = spec.table_name.clone();
-    let table_def = with_su(ADMIN_ID, || storage.pico_table.by_name(&table_name))??
-        .ok_or_else(|| PgError::other(format!("table does not exist: {}", spec.table_name)))?;
-
-    let columns_sql = if spec.columns.is_empty() {
-        default_copy_columns(&table_def)
-    } else {
-        let mut columns = Vec::with_capacity(spec.columns.len());
-        for column in &spec.columns {
-            let field = table_def
-                .format
-                .iter()
-                .find(|field| field.name == *column)
-                .ok_or_else(|| PgError::other(format!("column does not exist: {column}")))?;
-            columns.push(sql_quote_identifier(&field.name));
-        }
-        columns
-    };
-
-    let table_name_sql = sql_quote_identifier(&table_def.name);
-
-    Ok(ResolvedCopySpec {
-        table_name: table_def.name,
-        table_sql: table_name_sql,
-        field_count: columns_sql.len(),
-        columns_sql,
-        delimiter: spec.delimiter,
-        null_marker: spec.null_marker,
-        header: spec.header,
-        schema_version: table_def.schema_version,
-    })
-}
-
-fn load_table_schema_version(table_name: &SmolStr) -> PgResult<u64> {
+fn prepare_copy_target(
+    table_name: &SmolStr,
+    selected_columns: &[SmolStr],
+) -> PgResult<(DirectInsertTarget, Vec<Oid>)> {
     let storage = Catalog::try_get(false).expect("storage should be initialized");
     let table_def = with_su(ADMIN_ID, || storage.pico_table.by_name(table_name))??
         .ok_or_else(|| PgError::other(format!("table does not exist: {table_name}")))?;
-    Ok(table_def.schema_version)
+    let selected_fields = resolve_copy_fields(selected_columns, &table_def)?;
+    build_copy_target(&table_def, &selected_fields)
+}
+
+fn build_copy_target(
+    table_def: &TableDef,
+    selected_fields: &[(usize, &Field)],
+) -> PgResult<(DirectInsertTarget, Vec<Oid>)> {
+    let mut field_oids = Vec::with_capacity(selected_fields.len());
+    let mut input_positions = vec![None; table_def.format.len()];
+    for (input_position, (table_position, field)) in selected_fields.iter().enumerate() {
+        input_positions[*table_position] = Some(input_position);
+        field_oids.push(copy_field_oid(field)?);
+    }
+
+    let motion_key = match &table_def.distribution {
+        Distribution::ShardedImplicitly { sharding_key, .. } => Some(build_copy_motion_key(
+            table_def,
+            &input_positions,
+            sharding_key,
+        )?),
+        Distribution::Global | Distribution::ShardedByField { .. } => None,
+    };
+
+    let mut builder = Vec::with_capacity(table_def.format.len());
+    for (table_position, field) in table_def.format.iter().enumerate() {
+        if is_implicit_bucket_id_field(table_def, &field.name) {
+            builder.push(TupleBuilderCommand::CalculateBucketId(
+                motion_key
+                    .clone()
+                    .ok_or_else(|| PgError::other("insert motion key is missing"))?,
+            ));
+            continue;
+        }
+
+        match input_positions[table_position] {
+            Some(input_position) => builder.push(TupleBuilderCommand::TakePosition(input_position)),
+            None => builder.push(TupleBuilderCommand::SetValue(Column::default_value())),
+        }
+    }
+
+    Ok((
+        DirectInsertTarget::new(table_def.id, table_def.schema_version, builder),
+        field_oids,
+    ))
+}
+
+fn resolve_copy_fields<'a>(
+    selected_columns: &[SmolStr],
+    table_def: &'a TableDef,
+) -> PgResult<Vec<(usize, &'a Field)>> {
+    if selected_columns.is_empty() {
+        return Ok(default_copy_fields(table_def));
+    }
+
+    let mut seen_columns = BTreeSet::new();
+    let mut fields = Vec::with_capacity(selected_columns.len());
+    for column in selected_columns {
+        if !seen_columns.insert(column.as_str()) {
+            return Err(PgError::other(format!(
+                "column \"{}\" specified more than once",
+                column
+            )));
+        }
+
+        if is_implicit_bucket_id_field(table_def, column.as_str()) {
+            return Err(PgError::other(format!(
+                "system column \"{}\" cannot be inserted",
+                column
+            )));
+        }
+
+        let (position, field) = table_def
+            .format
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == *column)
+            .ok_or_else(|| PgError::other(format!("column does not exist: {column}")))?;
+        fields.push((position, field));
+    }
+
+    validate_required_copy_fields(table_def, &fields)?;
+    Ok(fields)
+}
+
+fn default_copy_fields(table_def: &TableDef) -> Vec<(usize, &Field)> {
+    table_def
+        .format
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !is_implicit_bucket_id_field(table_def, &field.name))
+        .collect()
+}
+
+fn validate_required_copy_fields(
+    table_def: &TableDef,
+    selected_fields: &[(usize, &Field)],
+) -> PgResult<()> {
+    let selected_names = selected_fields
+        .iter()
+        .map(|(_, field)| field.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for field in &table_def.format {
+        if is_implicit_bucket_id_field(table_def, field.name.as_str()) {
+            continue;
+        }
+
+        if !field.is_nullable && !selected_names.contains(field.name.as_str()) {
+            return Err(PgError::other(format!(
+                "NonNull column \"{}\" must be specified",
+                field.name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_implicit_bucket_id_field(table_def: &TableDef, field_name: &str) -> bool {
+    matches!(
+        table_def.distribution,
+        Distribution::ShardedImplicitly { .. }
+    ) && field_name == DEFAULT_BUCKET_ID_COLUMN_NAME
+}
+
+fn copy_field_oid(field: &Field) -> PgResult<Oid> {
+    let sbroad_type = SbroadType::try_from(field.field_type).map_err(|e| {
+        PgError::other(format!(
+            "unsupported column type {}: {e}",
+            field.field_type.as_str()
+        ))
+    })?;
+    Ok(super::storage::sbroad_type_to_pg(&sbroad_type).oid())
+}
+
+fn build_copy_motion_key(
+    table_def: &TableDef,
+    input_positions: &[Option<usize>],
+    sharding_key: &[SmolStr],
+) -> PgResult<MotionKey> {
+    let mut targets = Vec::with_capacity(sharding_key.len());
+    for key_column in sharding_key {
+        let table_position = table_def
+            .format
+            .iter()
+            .position(|field| field.name == *key_column)
+            .ok_or_else(|| PgError::other(format!("column does not exist: {key_column}")))?;
+        let target = match input_positions.get(table_position).copied().flatten() {
+            Some(input_position) => Target::Reference(input_position),
+            None => Target::Value(Column::default_value()),
+        };
+        targets.push(target);
+    }
+    Ok(MotionKey { targets })
+}
+
+fn map_copy_flush_error(table_name: &SmolStr, error: sql::errors::SbroadError) -> PgError {
+    match error {
+        sql::errors::SbroadError::OutdatedStorageSchema => PgError::other(format!(
+            "target table schema changed during execution: {table_name}"
+        )),
+        other => other.into(),
+    }
 }
 
 fn ensure_single_node_topology() -> PgResult<()> {
@@ -627,15 +734,28 @@ fn ensure_single_node_topology() -> PgResult<()> {
 
 pub fn start_copy(client_id: ClientId, spec: CopySpec) -> PgResult<CopyStart> {
     ensure_single_node_topology()?;
-    let resolved = resolve_copy_spec(spec)?;
+    ensure_supported_schema(spec.schema_name.as_ref())?;
+    let (target, field_oids) = prepare_copy_target(&spec.table_name, &spec.columns)?;
+    let runtime = StorageRuntime::new();
     let start = CopyStart {
-        column_count: resolved.field_count,
+        column_count: field_oids.len(),
     };
 
     COPY_SESSIONS.with(|storage| {
-        let prev = storage
-            .borrow_mut()
-            .insert(client_id, CopySession::new(resolved));
+        let prev = storage.borrow_mut().insert(
+            client_id,
+            CopySession::new(
+                spec.table_name.clone(),
+                target,
+                field_oids,
+                runtime,
+                spec.delimiter,
+                spec.null_marker,
+                spec.header,
+                DEFAULT_COPY_BATCH_SIZE,
+                DEFAULT_COPY_BATCH_BYTES,
+            ),
+        );
         if prev.is_some() {
             return Err(PgError::other("COPY session already exists"));
         }
@@ -661,7 +781,7 @@ pub fn on_copy_done(backend: &Backend) -> PgResult<usize> {
             .ok_or_else(|| {
                 PgError::ProtocolViolation(format_smolstr!("COPY session is missing"))
             })?;
-        session.on_copy_done(backend)
+        session.on_copy_done()
     })
 }
 
@@ -669,143 +789,4 @@ pub fn abort_copy(backend: &Backend) {
     COPY_SESSIONS.with(|storage| {
         storage.borrow_mut().remove(&backend.client_id());
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_spec(sql: &str) -> PgResult<CopySpec> {
-        let router = crate::sql::router::RouterRuntime::new();
-        let sql::Command::Copy(statement) =
-            sql::parse_command(&router, sql, &[]).map_err(PgError::other)?
-        else {
-            panic!("COPY statement");
-        };
-        CopySpec::try_from_statement(statement)
-    }
-
-    fn decode_row_parser(sql: &str) -> TextRowParser {
-        let spec = parse_spec(sql).expect("spec");
-        TextRowParser::new(spec.delimiter, spec.null_marker, 1)
-    }
-
-    #[test]
-    fn parses_supported_copy_spec() {
-        let spec = parse_spec(
-            r#"COPY "t" ("id", "value") FROM STDIN WITH (DELIMITER '|', NULL 'nil', HEADER true)"#,
-        )
-        .expect("copy spec");
-        assert_eq!(spec.table_name, "t");
-        assert_eq!(spec.columns, vec!["id", "value"]);
-        assert_eq!(spec.delimiter, b'|');
-        assert_eq!(spec.null_marker, b"nil");
-        assert!(spec.header);
-    }
-
-    #[test]
-    fn decodes_postgres_text_escapes() {
-        let parser = decode_row_parser(r#"COPY "t" FROM STDIN"#);
-        assert_eq!(
-            parser
-                .decode_text_field(br#"hello\\world\tok\n\141\x42"#)
-                .expect("decode"),
-            b"hello\\world\tok\naB"
-        );
-    }
-
-    #[test]
-    fn rejects_trailing_escape() {
-        let parser = decode_row_parser(r#"COPY "t" FROM STDIN"#);
-        let err = parser
-            .decode_text_field(br#"broken\"#)
-            .expect_err("must fail");
-        assert!(err.to_string().contains("ended inside an escape sequence"));
-    }
-
-    #[test]
-    fn text_record_reader_keeps_partial_record_across_messages() {
-        let mut reader = TextRecordReader::new();
-        reader.push(b"1\tal");
-        assert!(reader.next_record().expect("partial").is_none());
-
-        reader.push(b"pha\n2\tbeta\n");
-        assert_eq!(
-            reader.next_record().expect("first record").expect("first"),
-            b"1\talpha"
-        );
-        assert_eq!(
-            reader
-                .next_record()
-                .expect("second record")
-                .expect("second"),
-            b"2\tbeta"
-        );
-        assert!(reader.next_record().expect("drained").is_none());
-    }
-
-    #[test]
-    fn text_record_reader_finishes_tail_record_without_newline() {
-        let mut reader = TextRecordReader::new();
-        reader.push(b"1\talpha\r");
-        assert!(reader.next_record().expect("partial").is_none());
-        assert_eq!(
-            reader.finish_record().expect("tail record").expect("tail"),
-            b"1\talpha"
-        );
-        assert!(reader.finish_record().expect("drained").is_none());
-    }
-
-    #[test]
-    fn text_record_reader_handles_crlf_split_across_messages() {
-        let mut reader = TextRecordReader::new();
-        reader.push(b"1\talpha\r");
-        assert!(reader.next_record().expect("partial").is_none());
-
-        reader.push(b"\n2\tbeta\r\n");
-        assert_eq!(
-            reader.next_record().expect("first record").expect("first"),
-            b"1\talpha"
-        );
-        assert_eq!(
-            reader
-                .next_record()
-                .expect("second record")
-                .expect("second"),
-            b"2\tbeta"
-        );
-        assert!(reader.next_record().expect("drained").is_none());
-    }
-
-    #[test]
-    fn text_record_reader_treats_backslash_newline_as_data() {
-        let mut reader = TextRecordReader::new();
-        reader.push(b"1\thello\\\nworld\n2\tbeta\n");
-        assert_eq!(
-            reader.next_record().expect("first record").expect("first"),
-            b"1\thello\\\nworld"
-        );
-        assert_eq!(
-            reader
-                .next_record()
-                .expect("second record")
-                .expect("second"),
-            b"2\tbeta"
-        );
-        assert!(reader.next_record().expect("drained").is_none());
-    }
-
-    #[test]
-    fn text_record_reader_rejects_mixed_line_endings() {
-        let mut reader = TextRecordReader::new();
-        reader.push(b"1\talpha\n2\tbeta\r\n");
-        assert_eq!(
-            reader.next_record().expect("first record").expect("first"),
-            b"1\talpha"
-        );
-        let err = reader
-            .next_record()
-            .expect_err("mixed line endings must fail");
-        assert!(err.to_string().contains("mixed line endings"));
-    }
 }

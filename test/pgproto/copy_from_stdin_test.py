@@ -99,22 +99,46 @@ def test_copy_with_header_option(postgres: Postgres):
         assert rows == [(1, "x")]
 
 
-def test_copy_is_atomic_on_late_error(postgres: Postgres):
+def test_copy_streaming_default_commits_flushed_prefix_on_late_error(postgres: Postgres):
     with connect_admin(postgres) as conn:
-        create_test_table(conn, "copy_atomic_late_error")
+        create_test_table(conn, "copy_streaming_late_error")
 
-        prefix_rows = [f"{idx}\trow-{idx}\n" for idx in range(1, 257)]
-        tail_rows = [f"{idx}\ttail-{idx}\n" for idx in range(600, 603)]
-        with pytest.raises(psycopg.Error, match=r"(failed to bind parameter|not a valid int|invalid input syntax)"):
+        prefix_rows = [f"{idx}\trow-{idx}\n" for idx in range(1, 2049)]
+        with pytest.raises(psycopg.Error, match=r"(not a valid int|invalid input syntax)"):
             with conn.cursor() as cur:
-                with cur.copy('COPY "copy_atomic_late_error" ("id", "value") FROM STDIN') as copy:
+                with cur.copy('COPY "copy_streaming_late_error" ("id", "value") FROM STDIN') as copy:
                     for row in prefix_rows:
                         copy.write(row)
                     copy.write("bad\tboom\n")
-                    for row in tail_rows:
-                        copy.write(row)
 
-        assert count_rows(conn, "copy_atomic_late_error") == 0
+        persisted = count_rows(conn, "copy_streaming_late_error")
+        assert persisted > 0
+        assert persisted <= len(prefix_rows)
+        first_row = conn.execute(
+            'SELECT "id", "value" FROM "copy_streaming_late_error" WHERE "id" = 1'
+        ).fetchone()
+        assert first_row == (1, "row-1")
+
+
+def test_copy_batch_size_controls_streaming_flush_granularity(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_batch_size_late_error")
+
+        with pytest.raises(psycopg.Error, match=r"(not a valid int|invalid input syntax)"):
+            with conn.cursor() as cur:
+                with cur.copy(
+                    'COPY "copy_batch_size_late_error" ("id", "value") FROM STDIN WITH (BATCH_SIZE = 2)'
+                ) as copy:
+                    copy.write("1\tone\n")
+                    copy.write("2\ttwo\n")
+                    copy.write("3\tthree\n")
+                    copy.write("4\tfour\n")
+                    copy.write("bad\tboom\n")
+
+        rows = conn.execute(
+            'SELECT "id", "value" FROM "copy_batch_size_late_error" ORDER BY "id"'
+        ).fetchall()
+        assert rows == [(1, "one"), (2, "two"), (3, "three"), (4, "four")]
 
 
 def test_copy_client_fail_aborts_and_connection_recovers(postgres: Postgres):
@@ -239,6 +263,55 @@ def test_copy_rejects_too_many_columns_without_partial_rows(postgres: Postgres):
     with connect_admin(postgres) as check_conn:
         assert check_conn.execute("SELECT 1").fetchone() == (1,)
         assert count_rows(check_conn, "copy_too_many") == 0
+
+
+def test_copy_rejects_duplicate_columns_in_column_list(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_duplicate_columns")
+
+        with pytest.raises(psycopg.Error, match='column "id" specified more than once'):
+            with conn.cursor() as cur:
+                with cur.copy('COPY "copy_duplicate_columns" ("id", "id") FROM STDIN'):
+                    pass
+
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+        assert count_rows(conn, "copy_duplicate_columns") == 0
+
+
+def test_copy_rejects_missing_required_columns_in_column_list(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        create_test_table(conn, "copy_missing_required_column")
+
+        with pytest.raises(psycopg.Error, match='NonNull column "id" must be specified'):
+            with conn.cursor() as cur:
+                with cur.copy('COPY "copy_missing_required_column" ("value") FROM STDIN'):
+                    pass
+
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+        assert count_rows(conn, "copy_missing_required_column") == 0
+
+
+def test_copy_rejects_missing_required_global_bucket_id_column(postgres: Postgres):
+    with connect_admin(postgres) as conn:
+        conn.execute(
+            """
+            CREATE TABLE "copy_missing_global_bucket_id" (
+                "id" INT PRIMARY KEY,
+                "bucket_id" INT NOT NULL,
+                "value" TEXT
+            ) DISTRIBUTED GLOBALLY
+            """
+        )
+
+        with pytest.raises(psycopg.Error, match='NonNull column "bucket_id" must be specified'):
+            with conn.cursor() as cur:
+                with cur.copy(
+                    'COPY "copy_missing_global_bucket_id" ("id", "value") FROM STDIN'
+                ):
+                    pass
+
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+        assert count_rows(conn, "copy_missing_global_bucket_id") == 0
 
 
 def test_copy_rejects_trailing_escape_and_connection_recovers(postgres: Postgres):

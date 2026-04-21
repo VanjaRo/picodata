@@ -11,11 +11,12 @@ Copy = ${
     CopyTarget = { ^"stdin" | ^"stdout" }
     CopyWithOptions = ${ ^"with" ~ WO ~ "(" ~ WO ~ CopyOptionList? ~ WO ~ ")" }
         CopyOptionList = _{ CopyOption ~ (WO ~ "," ~ WO ~ CopyOption)* }
-        CopyOption = _{ CopyFormatOption | CopyDelimiterOption | CopyNullOption | CopyHeaderOption }
+        CopyOption = _{ CopyFormatOption | CopyDelimiterOption | CopyNullOption | CopyHeaderOption | CopyBatchSizeOption }
             CopyFormatOption = ${ ^"format" ~ W ~ CopyOptionValue }
             CopyDelimiterOption = ${ ^"delimiter" ~ W ~ SingleQuotedString }
             CopyNullOption = ${ ^"null" ~ W ~ SingleQuotedString }
             CopyHeaderOption = ${ ^"header" ~ (W ~ CopyBoolean)? }
+            CopyBatchSizeOption = ${ ^"batch_size" ~ WO ~ "=" ~ WO ~ Unsigned }
             CopyOptionValue = _{ SingleQuotedString | Identifier }
             CopyBoolean = { True | False }
     CopyLegacyOptions = _{ CopyLegacyOption ~ (W ~ CopyLegacyOption)* }

@@ -122,6 +122,20 @@ fn parse_with_options(options: &mut CopyOptions, pair: Pair<'_, Rule>) -> Result
                     .map(|value| value.as_str().eq_ignore_ascii_case("true"))
                     .unwrap_or(true);
             }
+            Rule::CopyBatchSizeOption => {
+                let raw = option
+                    .into_inner()
+                    .next()
+                    .expect("COPY batch_size must have a value")
+                    .as_str();
+                let batch_size = raw.parse::<usize>().map_err(|e| {
+                    SbroadError::Invalid(
+                        Entity::Query,
+                        Some(format_smolstr!("invalid COPY batch_size {raw}: {e}")),
+                    )
+                })?;
+                options.batch_size = Some(batch_size);
+            }
             _ => {}
         }
     }
@@ -234,6 +248,27 @@ mod tests {
                     delimiter: Some("|".into()),
                     null_string: Some("nil".into()),
                     header: true,
+                    batch_size: None,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn parses_copy_batch_size_option() {
+        let parsed = parse_copy(r#"COPY "t" FROM STDIN WITH (BATCH_SIZE = 2)"#);
+
+        assert_eq!(
+            parsed,
+            CopyStatement::From(CopyFrom {
+                table: CopyTableTarget {
+                    schema_name: None,
+                    table_name: "t".into(),
+                    columns: vec![],
+                },
+                options: CopyOptions {
+                    batch_size: Some(2),
+                    ..CopyOptions::default()
                 },
             })
         );
