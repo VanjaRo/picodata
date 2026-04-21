@@ -69,6 +69,28 @@ def test_copy_raw_wire_success_sequence(postgres: Postgres):
         assert rows == [(1, "alpha"), (2, "beta")]
 
 
+def test_copy_text_crlf_split_across_copydata_messages(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_crlf_split")
+
+    sock = _startup_copy_session(postgres, "copy_proto_crlf_split")
+    try:
+        send_copy_data_message(sock, b"1\talpha\r")
+        send_copy_data_message(sock, b"\n2\tbeta\r\n")
+        send_copy_done(sock)
+
+        messages = recv_until_ready(sock)
+        message_types = [message_type for message_type, _ in messages]
+        assert message_types[-2:] == [b"C", b"Z"]
+        assert messages[-2][1].startswith(b"COPY 2\x00")
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        rows = conn.execute('SELECT "id", "value" FROM "copy_proto_crlf_split" ORDER BY "id"').fetchall()
+        assert rows == [(1, "alpha"), (2, "beta")]
+
+
 def test_copy_extended_query_success_sequence(postgres: Postgres):
     create_test_table_via_instance(postgres, "copy_proto_extended")
 
@@ -213,6 +235,27 @@ def test_copy_server_side_error_recovers_connection_without_persisting_rows(post
 
     with connect_admin(postgres) as conn:
         assert count_rows(conn, "copy_server_error_state") == 0
+
+
+def test_copy_server_side_error_drops_stale_copydone_during_unwind(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_server_error_unwind")
+
+    sock = _startup_copy_session(postgres, "copy_server_error_unwind")
+    try:
+        send_copy_data_message(sock, b"1\n")
+        send_copy_done(sock)
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "22P02"
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+    finally:
+        send_terminate(sock)
+        sock.close()
+
+    with connect_admin(postgres) as conn:
+        assert count_rows(conn, "copy_server_error_unwind") == 0
 
 
 def test_copy_rejects_stale_schema_before_apply(postgres: Postgres):
