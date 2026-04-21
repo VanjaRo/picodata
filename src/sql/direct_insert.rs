@@ -3,9 +3,11 @@ use smol_str::format_smolstr;
 use sql::errors::{Action, Entity, SbroadError};
 use sql::executor::engine::helpers::{write_insert_args, TupleBuilderCommand, TupleBuilderPattern};
 use sql::executor::engine::{QueryCache, Vshard};
-use sql::executor::vtable::VTableTuple;
+use sql::executor::vtable::{VTableTuple, VirtualTable};
+use sql::ir::helpers::RepeatableState;
 use sql::ir::transformation::redistribution::{MotionKey, Target};
 use sql_protocol::dml::insert::ConflictPolicy;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use tarantool::error::{Error, TarantoolErrorCode};
 use tarantool::space::Space;
@@ -13,18 +15,28 @@ use tarantool::transaction::transaction;
 use tarantool::tuple::RawBytes;
 
 #[derive(Debug)]
-pub(crate) struct DirectInsertTarget {
+pub(crate) struct PreparedDirectInsert {
     table_id: u32,
     schema_version: u64,
     builder: TupleBuilderPattern,
+    conflict_policy: ConflictPolicy,
+    motion_key: Option<MotionKey>,
 }
 
-impl DirectInsertTarget {
-    pub(crate) fn new(table_id: u32, schema_version: u64, builder: TupleBuilderPattern) -> Self {
+impl PreparedDirectInsert {
+    pub(crate) fn new(
+        table_id: u32,
+        schema_version: u64,
+        builder: TupleBuilderPattern,
+        conflict_policy: ConflictPolicy,
+    ) -> Self {
+        let motion_key = find_insert_motion_key(&builder).cloned();
         Self {
             table_id,
             schema_version,
             builder,
+            conflict_policy,
+            motion_key,
         }
     }
 
@@ -33,24 +45,11 @@ impl DirectInsertTarget {
         runtime: &R,
         values: &VTableTuple,
     ) -> Result<Vec<u8>, SbroadError> {
-        let bucket_id = match find_insert_motion_key(&self.builder) {
-            Some(motion_key) => Some(determine_insert_bucket_id(runtime, values, motion_key)?),
-            None => None,
-        };
-
-        let mut encoded = Vec::new();
-        rmp::encode::write_array_len(&mut encoded, self.builder.len() as u32).map_err(|e| {
-            SbroadError::FailedTo(
-                Action::Encode,
-                Some(Entity::MsgPack),
-                format_smolstr!("{e}"),
-            )
-        })?;
-        write_insert_args(values, &self.builder, bucket_id.as_ref(), &mut encoded)?;
-        Ok(encoded)
+        let bucket_id = self.bucket_id_for_row(runtime, values)?;
+        self.encode_row_with_bucket(values, bucket_id.as_ref())
     }
 
-    pub(crate) fn flush_batch<R: QueryCache>(
+    pub(crate) fn insert_encoded_batch<R: QueryCache>(
         &self,
         runtime: &R,
         tuples: &[Vec<u8>],
@@ -59,11 +58,11 @@ impl DirectInsertTarget {
             return Ok(0);
         }
 
-        let space = ensure_target_space(runtime, self.table_id, self.schema_version)?;
+        let space = self.ensure_target_space(runtime)?;
         let inserted = transaction(|| -> Result<usize, SbroadError> {
             let mut inserted = 0usize;
             for tuple in tuples.iter() {
-                if insert_encoded_tuple(&space, tuple, ConflictPolicy::DoFail)? {
+                if insert_encoded_tuple(&space, tuple, self.conflict_policy)? {
                     inserted = inserted.saturating_add(1);
                 }
             }
@@ -71,6 +70,152 @@ impl DirectInsertTarget {
         })?;
         Ok(inserted)
     }
+
+    pub(crate) fn insert_vtable<R: Vshard + QueryCache>(
+        &self,
+        runtime: &R,
+        vtable: &VirtualTable,
+    ) -> Result<u64, SbroadError> {
+        let space = self.ensure_target_space(runtime)?;
+        insert_vtable_impl(
+            runtime,
+            &space,
+            self.conflict_policy,
+            &self.builder,
+            self.motion_key.as_ref(),
+            vtable,
+        )
+    }
+
+    fn ensure_target_space<R: QueryCache>(&self, runtime: &R) -> Result<Space, SbroadError> {
+        ensure_target_space(runtime, self.table_id, self.schema_version)
+    }
+
+    fn bucket_id_for_row<R: Vshard>(
+        &self,
+        runtime: &R,
+        values: &VTableTuple,
+    ) -> Result<Option<u64>, SbroadError> {
+        self.motion_key
+            .as_ref()
+            .map(|motion_key| determine_insert_bucket_id(runtime, values, motion_key))
+            .transpose()
+    }
+
+    fn encode_row_with_bucket(
+        &self,
+        values: &VTableTuple,
+        bucket_id: Option<&u64>,
+    ) -> Result<Vec<u8>, SbroadError> {
+        encode_row_with_builder(&self.builder, values, bucket_id)
+    }
+}
+
+pub(crate) fn insert_vtable<R: Vshard + QueryCache>(
+    runtime: &R,
+    table_id: u32,
+    schema_version: u64,
+    conflict_policy: ConflictPolicy,
+    builder: &TupleBuilderPattern,
+    vtable: &VirtualTable,
+) -> Result<u64, SbroadError> {
+    let space = ensure_target_space(runtime, table_id, schema_version)?;
+    insert_vtable_impl(
+        runtime,
+        &space,
+        conflict_policy,
+        builder,
+        find_insert_motion_key(builder),
+        vtable,
+    )
+}
+
+fn insert_vtable_impl<R: Vshard>(
+    runtime: &R,
+    space: &Space,
+    conflict_policy: ConflictPolicy,
+    builder: &TupleBuilderPattern,
+    motion_key: Option<&MotionKey>,
+    vtable: &VirtualTable,
+) -> Result<u64, SbroadError> {
+    let computed_bucket_index = build_bucket_index(runtime, motion_key, vtable)?;
+    let bucket_index = computed_bucket_index
+        .as_ref()
+        .unwrap_or_else(|| vtable.get_bucket_index());
+    let mut row_count = 0u64;
+
+    transaction(|| -> Result<(), SbroadError> {
+        let mut insert_one = |tuple_data: Vec<u8>| -> Result<(), SbroadError> {
+            if insert_encoded_tuple(space, &tuple_data, conflict_policy)? {
+                row_count += 1;
+            }
+            Ok(())
+        };
+
+        if bucket_index.is_empty() {
+            for vt_tuple in vtable.get_tuples() {
+                insert_one(encode_row_with_builder(builder, vt_tuple, None)?)?;
+            }
+            return Ok(());
+        }
+
+        for (bucket_id, positions) in bucket_index {
+            for pos in positions {
+                let vt_tuple = vtable.get_tuples().get(*pos).ok_or_else(|| {
+                    SbroadError::Invalid(
+                        Entity::VirtualTable,
+                        Some(format_smolstr!(
+                            "tuple at position {pos} not found in virtual table"
+                        )),
+                    )
+                })?;
+                insert_one(encode_row_with_builder(builder, vt_tuple, Some(bucket_id))?)?;
+            }
+        }
+
+        Ok(())
+    })?;
+
+    Ok(row_count)
+}
+
+fn build_bucket_index<R: Vshard>(
+    runtime: &R,
+    motion_key: Option<&MotionKey>,
+    vtable: &VirtualTable,
+) -> Result<Option<HashMap<u64, Vec<usize>, RepeatableState>>, SbroadError> {
+    if !vtable.get_bucket_index().is_empty() {
+        return Ok(None);
+    }
+
+    let Some(motion_key) = motion_key else {
+        return Ok(None);
+    };
+
+    let mut bucket_index: HashMap<u64, Vec<usize>, RepeatableState> =
+        HashMap::with_hasher(RepeatableState);
+    for (pos, vt_tuple) in vtable.get_tuples().iter().enumerate() {
+        let bucket_id = determine_insert_bucket_id(runtime, vt_tuple, motion_key)?;
+        bucket_index.entry(bucket_id).or_default().push(pos);
+    }
+    Ok(Some(bucket_index))
+}
+
+fn encode_row_with_builder(
+    builder: &TupleBuilderPattern,
+    values: &VTableTuple,
+    bucket_id: Option<&u64>,
+) -> Result<Vec<u8>, SbroadError> {
+    let mut encoded = Vec::new();
+    rmp::encode::write_array_len(&mut encoded, builder.len() as u32).map_err(|e| {
+        SbroadError::FailedTo(
+            Action::Encode,
+            Some(Entity::MsgPack),
+            format_smolstr!("{e}"),
+        )
+    })?;
+    write_insert_args(values, builder, bucket_id, &mut encoded)?;
+    Ok(encoded)
 }
 
 pub(crate) fn ensure_target_space<R: QueryCache>(

@@ -100,10 +100,10 @@ pub fn process_execute_message(
         ExecuteResult::Empty => {
             stream.write_message(messages::empty_query_response())?;
         }
-        ExecuteResult::CopyInStart { start } => {
+        ExecuteResult::CopyInStart { start, session } => {
             copy_in::send_copy_in_response(stream, &start)?;
             return Ok(MessageExecutionOutcome::EnterCopyIn(
-                copy_in::CopyInMode::ExtendedQuery,
+                copy_in::ActiveCopyIn::new(copy_in::CopyInMode::ExtendedQuery, session),
             ));
         }
     }

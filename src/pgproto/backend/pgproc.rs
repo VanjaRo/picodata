@@ -114,7 +114,7 @@ pub fn proc_pg_execute(id: ClientId, name: String, max_rows: i64) -> PgResult<Tu
         ExecuteResult::SuspendedDql { rows } => Ok(encode_proc_rows(rows.values(), false)),
         ExecuteResult::CopyInStart { .. } => {
             return Err(crate::pgproto::error::PgError::other(
-                "COPY IN portals are not supported by proc_pg_execute",
+                "COPY FROM STDIN is not supported by proc_pg_execute",
             ));
         }
     };

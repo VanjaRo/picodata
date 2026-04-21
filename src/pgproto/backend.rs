@@ -27,9 +27,9 @@ use tarantool::session::with_su;
 mod pgproc;
 mod well_known_queries;
 
-pub mod copy;
+pub(crate) mod copy;
 pub mod describe;
-pub mod result;
+pub(crate) mod result;
 pub mod storage;
 
 fn decode_parameter(bytes: Option<&[u8]>, oid: Oid, format: FieldFormat) -> PgResult<SbroadValue> {
@@ -117,7 +117,7 @@ pub fn bind(
         StatementKind::Sql(prepared_statement) => {
             PortalSource::Sql(prepared_statement.bind(params, effective_options)?)
         }
-        StatementKind::Copy(spec) => {
+        StatementKind::Copy(prepared_copy) => {
             if !params.is_empty() {
                 return Err(PgError::ProtocolViolation(format_smolstr!(
                     "bind message supplies {} parameters, but prepared statement \"{}\" requires 0",
@@ -125,7 +125,7 @@ pub fn bind(
                     statement_key.1,
                 )));
             }
-            PortalSource::Copy(spec.clone())
+            PortalSource::Copy(prepared_copy.clone())
         }
     };
 
@@ -136,7 +136,7 @@ pub fn bind(
     Ok(())
 }
 
-pub fn execute(id: ClientId, name: String, max_rows: i64) -> PgResult<ExecuteResult> {
+pub(crate) fn execute(id: ClientId, name: String, max_rows: i64) -> PgResult<ExecuteResult> {
     let key = storage::Key(id, name.into());
 
     let router = RouterRuntime::new();
@@ -162,7 +162,7 @@ pub fn parse(id: ClientId, name: String, query: &str, param_oids: Vec<Oid>) -> P
     let statement = match sql::parse_command(&router, query, &param_types)? {
         PlannerCommand::Copy(copy_statement) => Statement::new_copy(
             key.clone(),
-            copy::CopySpec::try_from_statement(copy_statement)?,
+            copy::PreparedCopy::try_from_statement(copy_statement, query)?,
         ),
         PlannerCommand::Sql(prepared_statement) => {
             Statement::new_sql(key.clone(), prepared_statement, param_oids)?
@@ -255,7 +255,7 @@ impl Backend {
     /// parse + bind + describe + execute and result is returned.
     ///
     /// Note that it closes the unnamed portal and statement even in case of a failure.
-    pub fn simple_query(&self, sql: &str) -> PgResult<ExecuteResult> {
+    pub(crate) fn simple_query(&self, sql: &str) -> PgResult<ExecuteResult> {
         let do_simple_query = || {
             let close_unnamed = || {
                 self.close_statement(None);
@@ -387,7 +387,7 @@ impl Backend {
     ///
     /// Take a portal from the storage and retrieve at most max_rows rows from it. In case of
     /// non-dql queries max_rows is ignored and result with no rows is returned.
-    pub fn execute(&self, portal: Option<String>, max_rows: i64) -> PgResult<ExecuteResult> {
+    pub(crate) fn execute(&self, portal: Option<String>, max_rows: i64) -> PgResult<ExecuteResult> {
         let name = portal.unwrap_or_default();
         execute(self.client_id, name, max_rows)
     }
@@ -413,20 +413,7 @@ impl Backend {
         close_client_portals(self.client_id)
     }
 
-    pub fn on_copy_data(&self, data: Bytes) -> PgResult<()> {
-        copy::on_copy_data(self, data)
-    }
-
-    pub fn on_copy_done(&self) -> PgResult<usize> {
-        copy::on_copy_done(self)
-    }
-
-    pub fn abort_copy(&self) {
-        copy::abort_copy(self)
-    }
-
     fn on_disconnect(&self) {
-        self.abort_copy();
         close_client_statements(self.client_id);
         close_client_portals(self.client_id);
     }

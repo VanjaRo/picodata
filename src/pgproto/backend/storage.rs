@@ -1,6 +1,6 @@
 use super::{
     close_client_statements,
-    copy::{self, CopySpec},
+    copy::{self, PreparedCopy},
     deallocate_statement,
     describe::{Describe, MetadataColumn, PortalDescribe, QueryType, StatementDescribe},
     result::{ExecuteResult, Rows},
@@ -247,7 +247,7 @@ pub static PGPROTO_STATEMENTS_CLOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new
 #[derive(Debug)]
 pub enum StatementKind {
     Sql(sql::PreparedStatement),
-    Copy(CopySpec),
+    Copy(PreparedCopy),
 }
 
 #[derive(Debug)]
@@ -301,11 +301,11 @@ impl Statement {
         Ok(Self(inner.into()))
     }
 
-    pub fn new_copy(key: Key, spec: CopySpec) -> Self {
+    pub fn new_copy(key: Key, copy: PreparedCopy) -> Self {
         let describe = StatementDescribe::new(Describe::copy(), vec![]);
         let inner = StatementInner {
             key,
-            statement: StatementKind::Copy(spec),
+            statement: StatementKind::Copy(copy),
             describe,
         };
 
@@ -575,7 +575,7 @@ enum PortalState {
     /// Ideally, it should've been `Box<Plan>`, but we need to move it
     /// from a mutable reference and we don't want to allocate a substitute.
     NotStarted(sql::BoundStatement),
-    CopyReady(CopySpec),
+    CopyReady(PreparedCopy),
     /// Portal has been executed and contains rows to be sent in batches.
     StreamingRows(IntoIter<Vec<PgValue>>),
     /// Portal has been executed and contains a result ready to be sent.
@@ -604,7 +604,7 @@ impl std::fmt::Display for PortalState {
 
 pub enum PortalSource {
     Sql(sql::BoundStatement),
-    Copy(CopySpec),
+    Copy(PreparedCopy),
 }
 
 pub static PGPROTO_PORTALS_OPENED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -731,6 +731,18 @@ impl PortalInner {
         Ok(state)
     }
 
+    fn start_copy(&self, prepared_copy: PreparedCopy) -> PgResult<ExecuteResult> {
+        if let Some(query) = prepared_copy.query_for_audit() {
+            audit::policy::log_dml_for_user(query, None);
+        }
+        if let Some(query) = prepared_copy.query_for_logging() {
+            tlog!(Info, "sql-log: {query}");
+        }
+        let (start, session) = copy::start_copy(prepared_copy.spec().clone())?;
+
+        Ok(ExecuteResult::CopyInStart { start, session })
+    }
+
     fn execute(&self, runtime: &RouterRuntime, max_rows: usize) -> PgResult<ExecuteResult> {
         let mut state = self.state.borrow_mut();
 
@@ -760,12 +772,9 @@ impl PortalInner {
                 PortalState::NotStarted(bound_statement) => {
                     Ok((None, self.start_sql(runtime, bound_statement)?))
                 }
-                PortalState::CopyReady(spec) => Ok((
-                    Some(ExecuteResult::CopyInStart {
-                        start: copy::start_copy(self.key.0, spec)?,
-                    }),
-                    PortalState::Done,
-                )),
+                PortalState::CopyReady(prepared_copy) => {
+                    Ok((Some(self.start_copy(prepared_copy)?), PortalState::Done))
+                }
                 PortalState::ResultReady(result) => Ok((Some(result), PortalState::Done)),
                 PortalState::StreamingRows(mut stored_rows) => {
                     let taken: Vec<_> = (&mut stored_rows).take(max_rows).collect();
@@ -840,7 +849,11 @@ impl Portal {
     }
 
     #[inline(always)]
-    pub fn execute(&self, runtime: &RouterRuntime, max_rows: usize) -> PgResult<ExecuteResult> {
+    pub(crate) fn execute(
+        &self,
+        runtime: &RouterRuntime,
+        max_rows: usize,
+    ) -> PgResult<ExecuteResult> {
         self.0.execute(runtime, max_rows)
     }
 }
