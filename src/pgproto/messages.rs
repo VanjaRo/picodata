@@ -1,4 +1,5 @@
 use super::backend::describe::CommandTag;
+use super::error::{PgError, PgResult};
 use super::stream::BeMessage;
 use bytes::Bytes;
 use pgwire::error::ErrorInfo;
@@ -8,8 +9,9 @@ use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,
 };
 use pgwire::messages::response::{NoticeResponse, ReadyForQuery, SslResponse, TransactionStatus};
-use pgwire::messages::{response, startup::*};
+use pgwire::messages::{response, startup::*, Message};
 use postgres_types::Oid;
+use smol_str::format_smolstr;
 
 /// Notice for the frontend.
 pub fn notice(message: String) -> BeMessage {
@@ -128,10 +130,66 @@ pub fn parameter_description(type_ids: Vec<Oid>) -> BeMessage {
     BeMessage::ParameterDescription(ParameterDescription::new(type_ids))
 }
 
-pub fn copy_in_response_text(column_count: usize) -> BeMessage {
-    BeMessage::CopyInResponse(CopyInResponse::new(
+const COPY_IN_RESPONSE_OVERHEAD_BYTES: usize = 7;
+
+fn copy_in_response_max_column_count() -> usize {
+    (CopyInResponse::max_message_length() - COPY_IN_RESPONSE_OVERHEAD_BYTES) / 2
+}
+
+pub fn copy_in_response_text(column_count: usize) -> PgResult<BeMessage> {
+    let response_column_count = i16::try_from(column_count).map_err(|_| {
+        PgError::FeatureNotSupported(format_smolstr!(
+            "COPY FROM STDIN does not support {column_count} columns: CopyInResponse encodes column count as Int16"
+        ))
+    })?;
+
+    let max_column_count = copy_in_response_max_column_count();
+    if column_count > max_column_count {
+        return Err(PgError::FeatureNotSupported(format_smolstr!(
+            "COPY FROM STDIN does not support {column_count} columns: CopyInResponse exceeds pgwire backend message limit of {} bytes (max {} columns)",
+            CopyInResponse::max_message_length(),
+            max_column_count
+        )));
+    }
+
+    Ok(BeMessage::CopyInResponse(CopyInResponse::new(
         0,
-        column_count as i16,
+        response_column_count,
         vec![0; column_count],
-    ))
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_in_response_text;
+    use crate::pgproto::error::PgError;
+    use pgwire::messages::copy::CopyInResponse;
+    use pgwire::messages::Message;
+
+    #[test]
+    fn copy_in_response_text_rejects_column_count_above_i16_max() {
+        let err = copy_in_response_text(i16::MAX as usize + 1).unwrap_err();
+
+        assert!(matches!(err, PgError::FeatureNotSupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "feature is not supported: COPY FROM STDIN does not support 32768 columns: CopyInResponse encodes column count as Int16"
+        );
+    }
+
+    #[test]
+    fn copy_in_response_text_rejects_column_count_above_pgwire_backend_limit() {
+        let backend_limit = CopyInResponse::max_message_length();
+        let max_column_count = super::copy_in_response_max_column_count();
+        let rejected_column_count = max_column_count + 1;
+        let err = copy_in_response_text(rejected_column_count).unwrap_err();
+
+        assert!(matches!(err, PgError::FeatureNotSupported(_)));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "feature is not supported: COPY FROM STDIN does not support {rejected_column_count} columns: CopyInResponse exceeds pgwire backend message limit of {backend_limit} bytes (max {max_column_count} columns)"
+            )
+        );
+    }
 }

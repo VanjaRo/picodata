@@ -93,7 +93,7 @@ pub(crate) enum ExecuteResult {
     },
     CopyInStart {
         start: CopyStart,
-        session: CopySession,
+        session: Box<CopySession>,
     },
     /// Result of an empty query.
     Empty,

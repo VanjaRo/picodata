@@ -2,8 +2,8 @@ import socket
 
 import pytest
 
-from conftest import Postgres
-from test.pgproto.copy_test_utils import (
+from conftest import Postgres, find_routed_pk
+from pgproto.copy_test_utils import (
     authenticate_md5,
     connect_admin,
     count_rows,
@@ -24,6 +24,13 @@ from test.pgproto.copy_test_utils import (
     send_terminate,
 )
 
+
+def _local_row_counts(postgres: Postgres, table_name: str, instance_count: int) -> list[int]:
+    return [
+        postgres.cluster.instances[index].eval(f'return box.space["{table_name}"]:count()')
+        for index in range(instance_count)
+    ]
+
 def _startup_copy_session(postgres: Postgres, table_name: str) -> socket.socket:
     user = "admin"
     password = "P@ssw0rd"
@@ -42,10 +49,16 @@ def _startup_copy_session(postgres: Postgres, table_name: str) -> socket.socket:
 
 def _assert_error_and_ready(sock: socket.socket) -> dict[str, str]:
     error_fields = None
+    unexpected_command_complete = None
     for message_type, payload in recv_until_ready(sock):
         if message_type == b"E":
             error_fields = parse_error_fields(payload)
+        elif message_type == b"C":
+            unexpected_command_complete = payload
     assert error_fields is not None
+    assert unexpected_command_complete is None, (
+        f"unexpected CommandComplete after COPY failure: {unexpected_command_complete!r}"
+    )
     return error_fields
 
 
@@ -149,6 +162,70 @@ def test_copy_extended_query_success_sequence(postgres: Postgres):
     with connect_admin(postgres) as conn:
         rows = conn.execute('SELECT "id", "value" FROM "copy_proto_extended" ORDER BY "id"').fetchall()
         assert rows == [(1, "alpha"), (2, "beta")]
+
+
+def test_copy_extended_query_sharded_remote_conflict_recovers_pipeline(postgres: Postgres):
+    create_test_table_via_instance(postgres, "copy_proto_extended_conflict")
+    remote_instance = postgres.cluster.add_instance(
+        wait_online=True, replicaset_name="copy_proto_conflict_rs2"
+    )
+    for instance in (postgres.instance, remote_instance):
+        postgres.cluster.wait_until_instance_has_this_many_active_buckets(
+            instance, 1500, max_retries=20
+        )
+
+    with connect_admin(postgres) as conn:
+        local_pk = find_routed_pk(postgres.instance, is_local=True)
+        remote_pk = find_routed_pk(postgres.instance, is_local=False, start=local_pk + 1)
+        conn.execute(
+            'INSERT INTO "copy_proto_extended_conflict" ("id", "value") VALUES (%s, %s)',
+            (remote_pk, "existing-remote"),
+        )
+
+    user = "admin"
+    password = "P@ssw0rd"
+    set_admin_password(postgres, password)
+
+    with socket.create_connection((postgres.host, postgres.port), timeout=5) as sock:
+        sock.settimeout(5)
+        authenticate_md5(sock, user, password)
+
+        send_parse(
+            sock,
+            "copy_stmt",
+            'COPY "copy_proto_extended_conflict" ("id", "value") '
+            "FROM STDIN WITH (SESSION_FLUSH_ROWS = 2, DESTINATION_FLUSH_ROWS = 2)",
+        )
+        send_bind(sock, portal_name="copy_portal", statement_name="copy_stmt")
+        send_execute(sock, portal_name="copy_portal")
+
+        assert recv_message(sock)[0] == b"1"
+        assert recv_message(sock)[0] == b"2"
+        assert recv_message(sock)[0] == b"G"
+
+        send_copy_data_message(sock, f"{local_pk}\tlocal-prefix\n{remote_pk}\tremote-conflict\n".encode())
+        send_copy_done(sock)
+        send_sync(sock)
+
+        error_fields = _assert_error_and_ready(sock)
+        assert error_fields.get("C") == "XX000"
+        assert "Duplicate key exists" in error_fields.get("M", "")
+
+        send_query(sock, "SELECT 1")
+        messages = recv_until_ready(sock)
+        assert [message_type for message_type, _ in messages][-2:] == [b"C", b"Z"]
+
+        send_terminate(sock)
+
+    with connect_admin(postgres) as conn:
+        rows = conn.execute(
+            'SELECT "id", "value" FROM "copy_proto_extended_conflict" ORDER BY "id"'
+        ).fetchall()
+        assert rows == [
+            (local_pk, "local-prefix"),
+            (remote_pk, "existing-remote"),
+        ]
+    assert sorted(_local_row_counts(postgres, "copy_proto_extended_conflict", 2)) == [1, 1]
 
 
 @pytest.mark.parametrize(

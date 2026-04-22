@@ -20,11 +20,11 @@ pub enum CopyInMessageOutcome {
 
 pub struct ActiveCopyIn {
     mode: CopyInMode,
-    session: Option<CopySession>,
+    session: Option<Box<CopySession>>,
 }
 
 impl ActiveCopyIn {
-    pub fn new(mode: CopyInMode, session: CopySession) -> Self {
+    pub fn new(mode: CopyInMode, session: Box<CopySession>) -> Self {
         Self {
             mode,
             session: Some(session),
@@ -37,7 +37,7 @@ impl ActiveCopyIn {
 
     fn session_mut(&mut self) -> PgResult<&mut CopySession> {
         self.session
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| PgError::ProtocolViolation(format_smolstr!("COPY session is missing")))
     }
 }
@@ -57,7 +57,7 @@ pub fn send_copy_in_response(
     stream: &mut PgStream<impl Read + Write>,
     start: &CopyStart,
 ) -> PgResult<()> {
-    stream.write_message(messages::copy_in_response_text(start.column_count))?;
+    stream.write_message(messages::copy_in_response_text(start.column_count)?)?;
     Ok(())
 }
 
