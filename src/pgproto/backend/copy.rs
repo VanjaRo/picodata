@@ -442,6 +442,13 @@ impl CopySession {
             .map_err(|error| map_copy_target_flush_error(self.target.table_name(), error))?;
         let row_bytes = encoded_row.len();
 
+        // Flush in two phases: `destination_would_exceed` /
+        // `session_would_exceed` trigger a pre-`write.push` flush when this
+        // row will not fit, then `destination_reached` / `session_reached`
+        // trigger a post-`write.push` flush when this row made the pending
+        // batch exactly full. The asymmetry is intentional so
+        // `flush_pending_destination` / `flush_pending_rows` report the right
+        // `CopyFlushReason`.
         if let Some(reason) = self.write.destination_would_exceed(
             destination.as_ref(),
             row_bytes,
@@ -1031,33 +1038,29 @@ fn require_positive_copy_option(name: &str, value: usize) -> PgResult<usize> {
 }
 
 fn resolve_copy_flush_thresholds(spec: &CopySpec) -> PgResult<CopyFlushThresholdsByScope> {
-    let session_rows = require_positive_copy_option(
-        "session_flush_rows",
-        spec.session_flush_rows.unwrap_or(COPY_FALLBACK_FLUSH_ROWS),
-    )?;
-    let destination_rows = require_positive_copy_option(
-        "destination_flush_rows",
-        spec.destination_flush_rows
-            .unwrap_or(COPY_FALLBACK_FLUSH_ROWS),
-    )?;
+    let session_rows = match spec.session_flush_rows {
+        Some(value) => require_positive_copy_option("session_flush_rows", value)?,
+        None => COPY_FALLBACK_FLUSH_ROWS,
+    };
+    let destination_rows = match spec.destination_flush_rows {
+        Some(value) => require_positive_copy_option("destination_flush_rows", value)?,
+        None => COPY_FALLBACK_FLUSH_ROWS,
+    };
+    let session_bytes = match spec.session_flush_bytes {
+        Some(value) => Some(require_positive_copy_option("session_flush_bytes", value)?),
+        None => Some(COPY_FALLBACK_FLUSH_BYTES),
+    };
+    let destination_bytes = match spec.destination_flush_bytes {
+        Some(value) => Some(require_positive_copy_option(
+            "destination_flush_bytes",
+            value,
+        )?),
+        None => Some(COPY_FALLBACK_FLUSH_BYTES),
+    };
 
     Ok(CopyFlushThresholdsByScope::new(
-        CopyFlushThresholds::new(
-            session_rows,
-            Some(require_positive_copy_option(
-                "session_flush_bytes",
-                spec.session_flush_bytes
-                    .unwrap_or(COPY_FALLBACK_FLUSH_BYTES),
-            )?),
-        ),
-        CopyFlushThresholds::new(
-            destination_rows,
-            Some(require_positive_copy_option(
-                "destination_flush_bytes",
-                spec.destination_flush_bytes
-                    .unwrap_or(COPY_FALLBACK_FLUSH_BYTES),
-            )?),
-        ),
+        CopyFlushThresholds::new(session_rows, session_bytes),
+        CopyFlushThresholds::new(destination_rows, destination_bytes),
     ))
 }
 
