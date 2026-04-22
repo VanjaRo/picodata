@@ -1,7 +1,7 @@
 use self::{
     describe::{PortalDescribe, StatementDescribe},
     result::ExecuteResult,
-    storage::{Portal, Statement, PG_PORTALS, PG_STATEMENTS},
+    storage::{Portal, PortalSource, Statement, StatementKind, PG_PORTALS, PG_STATEMENTS},
 };
 use super::{
     client::{ClientId, ClientParams},
@@ -19,7 +19,7 @@ use bytes::Bytes;
 use postgres_types::Oid;
 use smol_str::format_smolstr;
 use sql::ir::value::Value as SbroadValue;
-use sql::PreparedStatement;
+use sql::Command as PlannerCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage::param_oid_to_derived_type;
 use tarantool::session::with_su;
@@ -27,6 +27,7 @@ use tarantool::session::with_su;
 mod pgproc;
 mod well_known_queries;
 
+pub mod copy;
 pub mod describe;
 pub mod result;
 pub mod storage;
@@ -112,17 +113,24 @@ pub fn bind(
     };
     let effective_options = client_params.execution_options().unwrap_or(sql_options);
 
-    let bound_statement = statement
-        .prepared_statement()
-        .bind(params, effective_options)?;
+    let source = match statement.statement_kind() {
+        StatementKind::Sql(prepared_statement) => {
+            PortalSource::Sql(prepared_statement.bind(params, effective_options)?)
+        }
+        StatementKind::Copy(spec) => {
+            if !params.is_empty() {
+                return Err(PgError::ProtocolViolation(format_smolstr!(
+                    "bind message supplies {} parameters, but prepared statement \"{}\" requires 0",
+                    params.len(),
+                    statement_key.1,
+                )));
+            }
+            PortalSource::Copy(spec.clone())
+        }
+    };
 
     let portal_key = storage::Key(id, portal_name.into());
-    let portal = Portal::new(
-        portal_key.clone(),
-        statement.clone(),
-        result_format,
-        bound_statement,
-    )?;
+    let portal = Portal::new(portal_key.clone(), statement.clone(), result_format, source)?;
     PG_PORTALS.with(|storage| storage.borrow_mut().put(portal_key, portal))?;
 
     Ok(())
@@ -151,9 +159,15 @@ pub fn parse(id: ClientId, name: String, query: &str, param_oids: Vec<Oid>) -> P
         .map(|oid| param_oid_to_derived_type(*oid))
         .collect::<Result<_, _>>()?;
 
-    let prepared_statement = PreparedStatement::parse(&router, query, &param_types)?;
-
-    let statement = Statement::new(key.clone(), prepared_statement, param_oids)?;
+    let statement = match sql::parse_command(&router, query, &param_types)? {
+        PlannerCommand::Copy(copy_statement) => Statement::new_copy(
+            key.clone(),
+            copy::CopySpec::try_from_statement(copy_statement)?,
+        ),
+        PlannerCommand::Sql(prepared_statement) => {
+            Statement::new_sql(key.clone(), prepared_statement, param_oids)?
+        }
+    };
     PG_STATEMENTS.with(|storage| storage.borrow_mut().put(key, statement.into()))?;
 
     Ok(())
@@ -399,7 +413,43 @@ impl Backend {
         close_client_portals(self.client_id)
     }
 
+    pub fn on_copy_data(&self, data: Bytes) -> PgResult<()> {
+        copy::on_copy_data(self, data)
+    }
+
+    pub fn on_copy_done(&self) -> PgResult<usize> {
+        copy::on_copy_done(self)
+    }
+
+    pub fn abort_copy(&self) {
+        copy::abort_copy(self)
+    }
+
+    pub(crate) fn bind_sql_statement(
+        &self,
+        sql: &str,
+        params: Vec<Option<Bytes>>,
+    ) -> PgResult<sql::BoundStatement> {
+        let router = RouterRuntime::new();
+        let prepared = sql::PreparedStatement::parse(&router, sql, &[])?;
+        let inferred_types = prepared.collect_parameter_types();
+        let param_oids = storage::collect_param_oids(&inferred_types, &[]);
+        let params = decode_parameters(
+            params,
+            &param_oids,
+            &vec![FieldFormat::Text; param_oids.len()],
+            sql,
+        )?;
+
+        let Some(sql_options) = DYNAMIC_CONFIG.current_sql_options() else {
+            return Err(PgError::other("Not initialized yet"));
+        };
+        let effective_options = self.params.execution_options().unwrap_or(sql_options);
+        prepared.bind(params, effective_options).map_err(Into::into)
+    }
+
     fn on_disconnect(&self) {
+        self.abort_copy();
         close_client_statements(self.client_id);
         close_client_portals(self.client_id);
     }

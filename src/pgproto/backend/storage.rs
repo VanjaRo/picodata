@@ -1,5 +1,7 @@
 use super::{
-    close_client_statements, deallocate_statement,
+    close_client_statements,
+    copy::{self, CopySpec},
+    deallocate_statement,
     describe::{Describe, MetadataColumn, PortalDescribe, QueryType, StatementDescribe},
     result::{ExecuteResult, Rows},
 };
@@ -243,9 +245,15 @@ pub static PGPROTO_STATEMENTS_CLOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new
 });
 
 #[derive(Debug)]
+pub enum StatementKind {
+    Sql(sql::PreparedStatement),
+    Copy(CopySpec),
+}
+
+#[derive(Debug)]
 pub struct StatementInner {
     key: Key,
-    statement: sql::PreparedStatement,
+    statement: StatementKind,
     describe: StatementDescribe,
 }
 
@@ -265,7 +273,7 @@ impl Drop for StatementInner {
 pub struct Statement(Rc<StatementInner>);
 
 impl Statement {
-    pub fn new(
+    pub fn new_sql(
         key: Key,
         statement: sql::PreparedStatement,
         specified_param_oids: Vec<u32>,
@@ -278,7 +286,7 @@ impl Statement {
         let describe = StatementDescribe::new(describe, param_oids);
         let inner = StatementInner {
             key,
-            statement,
+            statement: StatementKind::Sql(statement),
             describe,
         };
 
@@ -293,8 +301,27 @@ impl Statement {
         Ok(Self(inner.into()))
     }
 
+    pub fn new_copy(key: Key, spec: CopySpec) -> Self {
+        let describe = StatementDescribe::new(Describe::copy(), vec![]);
+        let inner = StatementInner {
+            key,
+            statement: StatementKind::Copy(spec),
+            describe,
+        };
+
+        PGPROTO_STATEMENTS_OPENED_TOTAL.inc();
+        tlog!(
+            Debug,
+            "created new statement {} of type {:?}",
+            inner.key,
+            inner.describe.query_type()
+        );
+
+        Self(inner.into())
+    }
+
     #[inline(always)]
-    pub fn prepared_statement(&self) -> &sql::PreparedStatement {
+    pub fn statement_kind(&self) -> &StatementKind {
         &self.0.statement
     }
 
@@ -309,7 +336,10 @@ impl Statement {
     }
 
     pub fn ensure_valid(&self) -> PgResult<()> {
-        let stmt_plan = self.prepared_statement().as_plan();
+        let StatementKind::Sql(prepared_statement) = self.statement_kind() else {
+            return Ok(());
+        };
+        let stmt_plan = prepared_statement.as_plan();
         for table in stmt_plan.relations.tables.values() {
             let actual_version = with_su(ADMIN_ID, || get_table_version(&table.name))??;
             let cached_version = stmt_plan
@@ -442,7 +472,7 @@ pub fn collect_param_oids(inferred_types: &[SbroadType], client_types: &[Oid]) -
 
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
-pub struct PreparedStatementMetadata {
+pub struct StatementMetadata {
     pub query: String,
     pub tier: Option<SmolStr>,
     // Vector which contains pairs of
@@ -450,19 +480,21 @@ pub struct PreparedStatementMetadata {
     pub dk_meta: Vec<(u16, Oid)>,
 }
 
-pub fn build_prepared_statement_metadata(
-    prepared_statement: &sql::PreparedStatement,
-    query: &str,
-) -> PgResult<PreparedStatementMetadata> {
-    let tier = prepared_statement.as_plan().tier.clone();
-    let dk_meta = prepared_statement.as_plan().discover_sharding_key_info()?;
+pub fn build_statement_metadata(statement: &Statement, query: &str) -> PgResult<StatementMetadata> {
+    let (tier, dk_meta) = match statement.statement_kind() {
+        StatementKind::Sql(prepared_statement) => {
+            let tier = prepared_statement.as_plan().tier.clone();
+            let dk_meta = prepared_statement.as_plan().discover_sharding_key_info()?;
+            let dk_meta = dk_meta
+                .into_iter()
+                .map(|(idx, ty)| (idx, sbroad_type_to_pg(&ty).oid()))
+                .collect();
+            (tier, dk_meta)
+        }
+        StatementKind::Copy(_) => (None, vec![]),
+    };
 
-    let dk_meta: Vec<_> = dk_meta
-        .into_iter()
-        .map(|(idx, ty)| (idx, sbroad_type_to_pg(&ty).oid()))
-        .collect();
-
-    Ok(PreparedStatementMetadata {
+    Ok(StatementMetadata {
         query: query.to_string(),
         tier,
         dk_meta,
@@ -529,11 +561,21 @@ fn port_read_changed<'bytes>(mut port: impl Iterator<Item = &'bytes [u8]>) -> Pg
     Ok(changed)
 }
 
+pub(crate) fn execute_bound_dml(
+    router: &RouterRuntime,
+    statement: sql::BoundStatement,
+) -> PgResult<usize> {
+    let mut port = PicoPortOwned::new();
+    crate::sql::dispatch_bound_statement(router, statement, None, None, &mut port)?;
+    port_read_changed(port.iter())
+}
+
 enum PortalState {
     /// Portal has just been created.
     /// Ideally, it should've been `Box<Plan>`, but we need to move it
     /// from a mutable reference and we don't want to allocate a substitute.
     NotStarted(sql::BoundStatement),
+    CopyReady(CopySpec),
     /// Portal has been executed and contains rows to be sent in batches.
     StreamingRows(IntoIter<Vec<PgValue>>),
     /// Portal has been executed and contains a result ready to be sent.
@@ -551,12 +593,18 @@ impl std::fmt::Display for PortalState {
         use PortalState::*;
         match self {
             NotStarted(_) => f.debug_tuple("NotStarted").finish_non_exhaustive(),
+            CopyReady(_) => f.debug_tuple("CopyReady").finish_non_exhaustive(),
             StreamingRows(_) => f.debug_tuple("StreamingRows").finish_non_exhaustive(),
             ResultReady(_) => f.debug_struct("ResultReady").finish_non_exhaustive(),
             Done => f.debug_struct("Done").finish(),
             Errored => f.debug_struct("Errored").finish(),
         }
     }
+}
+
+pub enum PortalSource {
+    Sql(sql::BoundStatement),
+    Copy(CopySpec),
 }
 
 pub static PGPROTO_PORTALS_OPENED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -595,19 +643,32 @@ impl Drop for PortalInner {
 }
 
 impl PortalInner {
-    fn start(
+    fn start_sql(
         &self,
         router: &RouterRuntime,
         statement: sql::BoundStatement,
     ) -> PgResult<PortalState> {
         if let QueryType::Dml = self.describe.query_type() {
-            if let Some(query) = self.statement.prepared_statement().query_for_audit() {
-                audit::policy::log_dml_for_user(query, statement.params_for_audit());
+            if let StatementKind::Sql(prepared_statement) = self.statement.statement_kind() {
+                if let Some(query) = prepared_statement.query_for_audit() {
+                    audit::policy::log_dml_for_user(query, statement.params_for_audit());
+                }
             }
         }
-        if let Some(query) = self.statement.prepared_statement().query_for_logging() {
-            // Logs only the SQL text, not its parameters.
-            tlog!(Info, "sql-log: {query}");
+        if let StatementKind::Sql(prepared_statement) = self.statement.statement_kind() {
+            if let Some(query) = prepared_statement.query_for_logging() {
+                // Logs only the SQL text, not its parameters.
+                tlog!(Info, "sql-log: {query}");
+            }
+        }
+
+        if matches!(self.describe.query_type(), QueryType::Dml) {
+            let row_count = execute_bound_dml(router, statement)?;
+            let tag = self.describe.command_tag();
+            return Ok(PortalState::ResultReady(ExecuteResult::Dml {
+                row_count,
+                tag,
+            }));
         }
 
         let mut port = PicoPortOwned::new();
@@ -622,11 +683,7 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::Tcl { tag })
             }
-            QueryType::Dml => {
-                let row_count = port_read_changed(port.iter())?;
-                let tag = self.describe.command_tag();
-                PortalState::ResultReady(ExecuteResult::Dml { row_count, tag })
-            }
+            QueryType::Dml => unreachable!("DML portals use execute_bound_dml"),
             QueryType::Dql => {
                 let rows = port_read_tuples(
                     port.iter().skip(1),
@@ -636,7 +693,10 @@ impl PortalInner {
                 PortalState::StreamingRows(rows.into_iter())
             }
             QueryType::Explain => {
-                let ir_plan = self.statement.prepared_statement().as_plan();
+                let StatementKind::Sql(prepared_statement) = self.statement.statement_kind() else {
+                    return Err(PgError::other("COPY statement cannot produce EXPLAIN rows"));
+                };
+                let ir_plan = prepared_statement.as_plan();
                 let rows = if ir_plan.is_logical_explain() {
                     port_read_explain(port.iter(), port.size() as usize, self.describe.metadata())?
                 } else {
@@ -649,7 +709,10 @@ impl PortalInner {
                 PortalState::StreamingRows(rows.into_iter())
             }
             QueryType::Deallocate => {
-                let ir_plan = self.statement.prepared_statement().as_plan();
+                let StatementKind::Sql(prepared_statement) = self.statement.statement_kind() else {
+                    return Err(PgError::other("COPY statement cannot deallocate a plan"));
+                };
+                let ir_plan = prepared_statement.as_plan();
                 let top_id = ir_plan.get_top()?;
                 let deallocate = ir_plan.get_deallocate_node(top_id)?;
                 let name = deallocate.name.as_ref().map(|name| name.as_str());
@@ -661,6 +724,7 @@ impl PortalInner {
                 let tag = self.describe.command_tag();
                 PortalState::ResultReady(ExecuteResult::AclOrDdl { tag })
             }
+            QueryType::Copy => unreachable!("COPY portals are started from CopyReady"),
             QueryType::Empty => PortalState::ResultReady(ExecuteResult::Empty),
         };
 
@@ -694,8 +758,14 @@ impl PortalInner {
             // run the state machine until a return value is produced as a `Some`
             let result = step_portal(&mut state, |state| match state {
                 PortalState::NotStarted(bound_statement) => {
-                    Ok((None, self.start(runtime, bound_statement)?))
+                    Ok((None, self.start_sql(runtime, bound_statement)?))
                 }
+                PortalState::CopyReady(spec) => Ok((
+                    Some(ExecuteResult::CopyInStart {
+                        start: copy::start_copy(self.key.0, spec)?,
+                    }),
+                    PortalState::Done,
+                )),
                 PortalState::ResultReady(result) => Ok((Some(result), PortalState::Done)),
                 PortalState::StreamingRows(mut stored_rows) => {
                     let taken: Vec<_> = (&mut stored_rows).take(max_rows).collect();
@@ -737,11 +807,15 @@ impl Portal {
         key: Key,
         statement: Statement,
         output_format: Vec<FieldFormat>,
-        bound_statement: sql::BoundStatement,
+        source: PortalSource,
     ) -> PgResult<Self> {
         let stmt_describe = statement.describe();
         let describe = PortalDescribe::new(stmt_describe.describe.clone(), output_format);
-        let state = PortalState::NotStarted(bound_statement).into();
+        let state = match source {
+            PortalSource::Sql(bound_statement) => PortalState::NotStarted(bound_statement),
+            PortalSource::Copy(spec) => PortalState::CopyReady(spec),
+        }
+        .into();
         let inner = PortalInner {
             key,
             statement,

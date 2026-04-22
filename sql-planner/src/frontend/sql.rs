@@ -7704,6 +7704,7 @@ pub fn try_parse_datetime(s: &str) -> Option<Datetime> {
 }
 
 pub mod ast;
+pub(crate) mod command;
 pub mod ir;
 pub mod tree;
 mod type_system;

@@ -90,6 +90,14 @@ pub enum ExecuteResult {
         /// necessary to cache the number of rows before retrieving them.
         row_count: usize,
     },
+    CopyInStart {
+        start: CopyStart,
+    },
     /// Result of an empty query.
     Empty,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyStart {
+    pub column_count: usize,
 }
