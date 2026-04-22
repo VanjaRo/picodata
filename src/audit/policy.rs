@@ -46,15 +46,26 @@ pub fn is_dml_audit_enabled_for_user(plan: &ir::Plan) -> Result<bool, SbroadErro
     }
 
     let current_user = util::effective_user_id();
+    user_has_audit_policy(current_user, DmlDefaultPolicy::ID)
+        .map_err(|e| SbroadError::Other(e.to_smolstr()))
+}
+
+/// Determines whether generic DML logging is enabled for the current user,
+/// without requiring a planner plan shape.
+pub fn is_dml_audit_enabled_for_current_user() -> traft::Result<bool> {
+    if crate::audit::root().is_none() {
+        return Ok(false);
+    }
+
+    user_has_audit_policy(util::effective_user_id(), DmlDefaultPolicy::ID)
+}
+
+fn user_has_audit_policy(user_id: u32, policy_id: AuditPolicyId) -> traft::Result<bool> {
     with_su(schema::ADMIN_ID, || -> traft::Result<bool> {
         let node = traft::node::global()?;
         let space = &node.storage.users_audit_policies.space;
-        if space.get(&(current_user, DmlDefaultPolicy::ID))?.is_none() {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(space.get(&(user_id, policy_id))?.is_some())
     })?
-    .map_err(|e| SbroadError::Other(e.to_smolstr()))
 }
 
 /// Performs the DML operation audit logging.
